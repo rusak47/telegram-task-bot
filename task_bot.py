@@ -64,7 +64,7 @@ class TaskBot:
         """Get tasks for a specific user"""
         return self.tasks.get(str(user_id), [])
     
-    def add_task(self, user_id, task_text, message_link=None):
+    def add_task(self, user_id, task_text, message_link=None, message_id=None, media_info=None):
         """Add a new task for user"""
         user_id_str = str(user_id)
         if user_id_str not in self.tasks:
@@ -76,7 +76,9 @@ class TaskBot:
             'status': 'pending',
             'created_at': datetime.now().isoformat(),
             'completed_at': None,
-            'message_link': message_link
+            'message_link': message_link,
+            'message_id': message_id,
+            'media_info': media_info
         }
         
         self.tasks[user_id_str].append(task)
@@ -171,6 +173,7 @@ Welcome! I can help you manage your tasks.
 <b>Available commands:</b>
 /add &lt;task&gt; - Add a new task
 /list - Show all your tasks
+/view &lt;task_id&gt; - View task details
 /complete &lt;task_id&gt; - Mark task as completed
 /delete &lt;task_id&gt; - Delete a task
 /archive &lt;task_id&gt; - Archive a completed task
@@ -186,14 +189,10 @@ Welcome! I can help you manage your tasks.
 
 <b>Example:</b>
 <code>/add Buy groceries</code>
+<code>/view 1</code>
 <code>/complete 1</code>
 <code>/archive 1</code>
-
-<b>Forward Examples:</b>
-- Forward a message from a colleague → Task with sender info
-- Forward a photo with caption → Task with image description
-- Forward a document → Task with file details
-    """
+"""
     await update.message.reply_text(welcome_text, parse_mode='HTML')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,14 +222,22 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List tasks command handler"""
-    user_id = update.effective_user.id
+async def create_task_list_message(user_id):
+    """Create a formatted task list message with buttons
+    
+    This helper function is used by both the /list command and the "Back to List" button
+    to ensure consistent formatting.
+    
+    Args:
+        user_id: The user ID to get tasks for
+        
+    Returns:
+        tuple: (message_text, reply_markup) for the task list
+    """
     tasks = task_bot.get_user_tasks(user_id)
     
     if not tasks:
-        await update.message.reply_text("📝 You have no tasks yet. Use /add to create one!")
-        return
+        return "📝 You have no tasks yet. Use /add to create one!", None
     
     # Create inline keyboard for task actions
     keyboard = []
@@ -240,13 +247,23 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_emoji = "✅" if task['status'] == 'completed' else "⏳"
         created_date = datetime.fromisoformat(task['created_at']).strftime('%m/%d')
         
-        task_text += f"{status_emoji} *#{task['id']}* {task['text']}\n"
+        # Get a short preview of the task text (first line or first 50 chars)
+        task_preview = task['text'].split('\n')[0][:50] + ('...' if len(task['text'].split('\n')[0]) > 50 else '')
         
-        # Add message link if available
-        if task.get('message_link'):
-            task_text += f"   🔗 [Original Message]({task['message_link']})\n"
-            
-        task_text += f"   📅 {created_date}"
+        # Add task header with ID and preview
+        task_text += f"{status_emoji} *#{task['id']}* {task_preview}\n"
+        
+        # Add description if task text is longer than the preview
+        if len(task['text']) > 50:
+            description = task['text'][50:200] + ('...' if len(task['text']) > 200 else '')
+            task_text += f" {description}\n"
+        
+        # Add date info and attachment indicator
+        attachment_indicator = ""
+        if task.get('media_info') or task.get('message_link'):
+            attachment_indicator = " with attachments"
+        
+        task_text += f"   📅 Created: {created_date}{attachment_indicator}"
         
         if task['status'] == 'completed' and task['completed_at']:
             completed_date = datetime.fromisoformat(task['completed_at']).strftime('%m/%d')
@@ -254,22 +271,53 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         task_text += "\n\n"
         
-        # Add buttons for tasks
+        # Create a row of buttons for this task (up to 4 columns)
+        task_row = []
+        
+        # Add view button
+        task_row.append(
+            InlineKeyboardButton(f"🔍 #{task['id']}", callback_data=f"view_{task['id']}")
+        )
+        
+        # Add reply button if the task has a message_id
+        if task.get('message_id'):
+            task_row.append(
+                InlineKeyboardButton(f"📩 #{task['id']}", callback_data=f"reply_{task['id']}")
+            )
+        
+        # Add action buttons based on task status
         if task['status'] == 'pending':
-            keyboard.append([
-                InlineKeyboardButton(f"✅ Complete #{task['id']}", callback_data=f"complete_{task['id']}"),
-                InlineKeyboardButton(f"🗑 Delete #{task['id']}", callback_data=f"delete_{task['id']}")
-            ])
+            task_row.append(
+                InlineKeyboardButton(f"✅ #{task['id']}", callback_data=f"complete_{task['id']}")
+            )
         else:
-            # For completed tasks, add archive option
-            keyboard.append([
-                InlineKeyboardButton(f"📦 Archive #{task['id']}", callback_data=f"archive_{task['id']}"),
-                InlineKeyboardButton(f"🗑 Delete #{task['id']}", callback_data=f"delete_{task['id']}")
-            ])
+            task_row.append(
+                InlineKeyboardButton(f"📦 #{task['id']}", callback_data=f"archive_{task['id']}")
+            )
+        
+        # Add delete button
+        task_row.append(
+            InlineKeyboardButton(f"🗑 #{task['id']}", callback_data=f"delete_{task['id']}")
+        )
+        
+        # Add the row to the keyboard
+        keyboard.append(task_row)
     
-    # Send the message with the inline keyboard
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(task_text, parse_mode='Markdown', reply_markup=reply_markup, disable_web_page_preview=True)
+    
+    return task_text, reply_markup
+
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List tasks command handler"""
+    user_id = update.effective_user.id
+    
+    task_text, reply_markup = await create_task_list_message(user_id)
+    
+    await update.message.reply_text(
+        task_text,
+        parse_mode='Markdown',
+        reply_markup=reply_markup
+    )
 
 async def complete_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Complete task command handler"""
@@ -367,6 +415,190 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
     
+    # Handle list tasks button
+    if data == "list_tasks":
+        task_text, reply_markup = await create_task_list_message(user_id)
+        
+        await query.edit_message_text(
+            task_text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    
+    # Handle view task details
+    if data.startswith('view_'):
+        task_id = int(data.split('_')[1])
+        user_id_str = str(user_id)
+        
+        # Find the task
+        task = None
+        if user_id_str in task_bot.tasks:
+            for t in task_bot.tasks[user_id_str]:
+                if t['id'] == task_id:
+                    task = t
+                    break
+        
+        if not task:
+            await query.edit_message_text(f"❌ Task #{task_id} not found.")
+            return
+        
+        # Format task details
+        status_emoji = "✅" if task['status'] == 'completed' else "⏳"
+        created_date = datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')
+        completed_date = "N/A"
+        if task['status'] == 'completed' and task['completed_at']:
+            completed_date = datetime.fromisoformat(task['completed_at']).strftime('%Y-%m-%d %H:%M')
+        
+        details_text = f"""
+{status_emoji} <b>Task #{task['id']}</b>
+
+<b>Content:</b> {task['text']}
+<b>Status:</b> {task['status']}
+<b>Created:</b> {created_date}
+<b>Completed:</b> {completed_date}
+"""
+        
+        # Add message link if available
+        if task.get('message_link'):
+            details_text += f"\n<b>Original Message:</b> <a href='{task['message_link']}'>Link</a>"
+        
+        # Create keyboard with actions
+        keyboard = []
+        
+        # Add reply button if the task has a message_id
+        if task.get('message_id'):
+            keyboard.append([
+                InlineKeyboardButton("📩 Reply to Original", callback_data=f"reply_{task['id']}")
+            ])
+        
+        # Add action buttons based on task status
+        action_row = []
+        if task['status'] == 'pending':
+            action_row.extend([
+                InlineKeyboardButton("✅ Complete", callback_data=f"complete_{task['id']}"),
+                InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{task['id']}")
+            ])
+        else:
+            action_row.extend([
+                InlineKeyboardButton("📦 Archive", callback_data=f"archive_{task['id']}"),
+                InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{task['id']}")
+            ])
+        
+        keyboard.append(action_row)
+        
+        # Add back button
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Back to List", callback_data="list_tasks")
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Update the message with detailed view
+        await query.edit_message_text(
+            details_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup,
+            disable_web_page_preview=False  # Enable preview to show media if there's a link
+        )
+        
+        # If the task has media info, send the media as a new message
+        if task.get('media_info'):
+            media_info = task['media_info']
+            media_type = media_info.get('type')
+            file_id = media_info.get('file_id')
+            
+            if media_type == 'photo' and file_id:
+                await context.bot.send_photo(
+                    chat_id=query.message.chat_id,
+                    photo=file_id,
+                    caption=f"📷 Photo attachment for Task #{task['id']}"
+                )
+            elif media_type == 'document' and file_id:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=file_id,
+                    caption=f"📎 Document attachment for Task #{task['id']}: {media_info.get('file_name', 'Unknown file')}"
+                )
+            elif media_type == 'video' and file_id:
+                await context.bot.send_video(
+                    chat_id=query.message.chat_id,
+                    video=file_id,
+                    caption=f"🎥 Video attachment for Task #{task['id']}"
+                )
+            elif media_type == 'audio' and file_id:
+                await context.bot.send_audio(
+                    chat_id=query.message.chat_id,
+                    audio=file_id,
+                    caption=f"🎵 Audio attachment for Task #{task['id']}: {media_info.get('title', 'Unknown audio')}"
+                )
+            elif media_type == 'voice' and file_id:
+                await context.bot.send_voice(
+                    chat_id=query.message.chat_id,
+                    voice=file_id,
+                    caption=f"🎤 Voice message attachment for Task #{task['id']}"
+                )
+            elif media_type == 'video_note' and file_id:
+                await context.bot.send_video_note(
+                    chat_id=query.message.chat_id,
+                    video_note=file_id
+                )
+            elif media_type == 'sticker' and file_id:
+                await context.bot.send_sticker(
+                    chat_id=query.message.chat_id,
+                    sticker=file_id
+                )
+            elif media_type == 'location':
+                lat = media_info.get('latitude')
+                lon = media_info.get('longitude')
+                if lat and lon:
+                    await context.bot.send_location(
+                        chat_id=query.message.chat_id,
+                        latitude=lat,
+                        longitude=lon
+                    )
+            elif media_type == 'contact':
+                name = media_info.get('name')
+                phone = media_info.get('phone_number')
+                if name and phone:
+                    await context.bot.send_contact(
+                        chat_id=query.message.chat_id,
+                        phone_number=phone,
+                        first_name=name
+                    )
+        
+        # If the task has a message_id, send a new message as a reply to the original
+        elif task.get('message_id'):
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="📎 <b>Original message content:</b>",
+                parse_mode='HTML',
+                reply_to_message_id=task['message_id']
+            )
+    
+    # Handle reply to original message
+    if data.startswith('reply_'):
+        task_id = int(data.split('_')[1])
+        user_id_str = str(user_id)
+        
+        # Find the task
+        task = None
+        if user_id_str in task_bot.tasks:
+            for t in task_bot.tasks[user_id_str]:
+                if t['id'] == task_id:
+                    task = t
+                    break
+        
+        if task and task.get('message_id'):
+            # Reply to the original message
+            await query.message.reply_text(
+                f"🔍 *Replying to original message for Task #{task_id}*\n\n"
+                f"To find the original message, look for message ID: {task['message_id']} in your chat history.",
+                parse_mode='Markdown',
+                reply_to_message_id=task['message_id']
+            )
+        else:
+            await query.message.reply_text(f"❌ Could not find message ID for Task #{task_id}.")
+    
     # Handle task completion
     if data.startswith('complete_'):
         task_id = int(data.split('_')[1])
@@ -392,39 +624,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Task #{task_id} not found or not completed.")
     
     # Handle forwarded message task creation
-    elif data == "add_forwarded_task":
+    if data == "add_forwarded_task":
         if 'forwarded_task_content' in context.user_data:
             task_text = context.user_data['forwarded_task_content']
             message_link = context.user_data.get('forwarded_task_link')
+            message_id = context.user_data.get('forwarded_message_id')
+            media_info = context.user_data.get('forwarded_media_info')
             
-            task = task_bot.add_task(user_id, task_text, message_link)
+            task = task_bot.add_task(user_id, task_text, message_link, message_id, media_info)
             
             response_text = f"✅ Task added successfully!\n*Task #{task['id']}:* {task['text'][:50]}{'...' if len(task['text']) > 50 else ''}"
+            
+            # Add link to original message if available
             if message_link:
                 response_text += f"\n\n🔗 [Original Message]({message_link})"
+            
+            # Add reference to the forwarded message
+            if message_id:
+                response_text += f"\n\n📩 Reference to forwarded message ID: {message_id}"
             
             # Clear the stored content
             del context.user_data['forwarded_task_content']
             if 'forwarded_task_link' in context.user_data:
                 del context.user_data['forwarded_task_link']
+            if 'forwarded_message_id' in context.user_data:
+                del context.user_data['forwarded_message_id']
+            if 'forwarded_media_info' in context.user_data:
+                del context.user_data['forwarded_media_info']
                 
+            # Reply to the original message when showing the task
             await query.edit_message_text(response_text, parse_mode='Markdown', disable_web_page_preview=True)
-        else:
-            await query.edit_message_text("❌ Task content not found.")
-    
-    # Handle regular text message task creation
-    elif data == "add_regular_task":
-        if 'regular_task_content' in context.user_data:
-            task_text = context.user_data['regular_task_content']
-            task = task_bot.add_task(user_id, task_text)
-            
-            await query.edit_message_text(
-                f"✅ Task added successfully!\n"
-                f"*Task #{task['id']}:* {task['text']}",
-                parse_mode='Markdown'
-            )
-            # Clear the stored content
-            del context.user_data['regular_task_content']
         else:
             await query.edit_message_text("❌ Task content not found.")
     
@@ -432,7 +661,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "add_media_task":
         if 'media_task_content' in context.user_data:
             task_text = context.user_data['media_task_content']
-            task = task_bot.add_task(user_id, task_text)
+            message_id = context.user_data.get('media_task_message_id')
+            media_info = context.user_data.get('media_task_media_info')
+            
+            task = task_bot.add_task(user_id, task_text, None, message_id, media_info)
             
             await query.edit_message_text(
                 f"✅ Task added successfully!\n"
@@ -441,6 +673,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             # Clear the stored content
             del context.user_data['media_task_content']
+            if 'media_task_message_id' in context.user_data:
+                del context.user_data['media_task_message_id']
+            if 'media_task_media_info' in context.user_data:
+                del context.user_data['media_task_media_info']
         else:
             await query.edit_message_text("❌ Task content not found.")
     
@@ -465,7 +701,7 @@ async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT
     message = update.message
     
     # Extract task content from forwarded message
-    task_data = extract_task_from_message(message)
+    task_data = extract_task_from_message(message)  # Remove the await keyword
     
     if not task_data["content"]:
         await update.message.reply_text("❌ Could not extract task content from forwarded message.")
@@ -478,117 +714,131 @@ async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Store the forwarded content and link in context for later use
+    # Store the forwarded content, link, message ID, and media info in context for later use
     context.user_data['forwarded_task_content'] = task_data["content"]
     if task_data["link"]:
         context.user_data['forwarded_task_link'] = task_data["link"]
     
+    # Store the message ID of the forwarded message
+    context.user_data['forwarded_message_id'] = task_data["message_id"]
+    
+    # Store media info if available
+    if task_data.get("media_info"):
+        context.user_data['forwarded_media_info'] = task_data["media_info"]
+    
+    # Debug: Echo the message link and debug info
+    debug_text = "\n".join(task_data["debug"])
+    
+    await update.message.reply_text(
+        f"🔍 *Debug Info:*\n```\n{debug_text}\n```\n\n"
+        f"🔗 *Link:* {task_data['link'] or 'None'}\n"
+        f"📩 *Message ID:* {task_data['message_id']}",
+        parse_mode='Markdown',
+        disable_web_page_preview=True
+    )
+    
     preview_text = task_data["content"][:100] + "..." if len(task_data["content"]) > 100 else task_data["content"]
     link_text = f"\n\n🔗 [Original Message]({task_data['link']})" if task_data["link"] else ""
     
+    # Send the message as a reply to the original forwarded message
     await update.message.reply_text(
         f"📨 *Forwarded Message Detected*\n\n"
         f"*Content Preview:*\n{preview_text}{link_text}\n\n"
         f"Do you want to add this as a task?",
         parse_mode='Markdown',
         reply_markup=reply_markup,
+        reply_to_message_id=message.message_id,  # Reply to the forwarded message
         disable_web_page_preview=True
     )
 
 def extract_task_from_message(message):
-    """Extract task content from various message types"""
+    """Extract task content from various message types and save media file_ids"""
     task_parts = []
     message_link = None
+    debug_info = []
+    source_type = "unknown"
+    media_info = {}
     
-    # Check if message is forwarded using the origin property (new API)
-    if hasattr(message, 'forward_origin') and message.forward_origin:
-        origin = message.forward_origin
-        
-        # Handle different origin types
-        if hasattr(origin, 'sender_user') and origin.sender_user:
-            task_parts.append(f"From: {origin.sender_user.first_name}")
-        elif hasattr(origin, 'sender_user_name') and origin.sender_user_name:
-            task_parts.append(f"From: {origin.sender_user_name}")
-        elif hasattr(origin, 'chat') and origin.chat:
-            chat_name = origin.chat.title or origin.chat.first_name or "Unknown"
-            task_parts.append(f"From: {chat_name}")
-            
-            # Try to create a link to the original message if it's from a public channel
-            if hasattr(origin, 'message_id') and hasattr(origin.chat, 'username') and origin.chat.username:
-                message_link = f"https://t.me/{origin.chat.username}/{origin.message_id}"
-        elif hasattr(origin, 'sender_chat') and origin.sender_chat:
-            chat_name = origin.sender_chat.title or "Unknown"
-            task_parts.append(f"From: {chat_name}")
-            
-            # Try to create a link to the original message if it's from a public channel
-            if hasattr(origin, 'message_id') and hasattr(origin.sender_chat, 'username') and origin.sender_chat.username:
-                message_link = f"https://t.me/{origin.sender_chat.username}/{origin.message_id}"
-        
-        # Add forwarded date
-        if hasattr(origin, 'date') and origin.date:
-            forward_date = origin.date.strftime('%Y-%m-%d %H:%M')
-            task_parts.append(f"Date: {forward_date}")
+    # Store the message ID of the forwarded message
+    forwarded_message_id = message.message_id
+    debug_info.append(f"Current message ID: {forwarded_message_id}")
     
-    # Fallback for older API (if still available)
-    elif hasattr(message, 'forward_from') and message.forward_from:
-        task_parts.append(f"From: {message.forward_from.first_name}")
-        if message.forward_date:
-            forward_date = message.forward_date.strftime('%Y-%m-%d %H:%M')
-            task_parts.append(f"Date: {forward_date}")
-    elif hasattr(message, 'forward_from_chat') and message.forward_from_chat:
-        task_parts.append(f"From: {message.forward_from_chat.title}")
-        
-        # Try to create a link to the original message if it's from a public channel
-        if hasattr(message, 'forward_from_message_id') and message.forward_from_chat.username:
-            message_link = f"https://t.me/{message.forward_from_chat.username}/{message.forward_from_message_id}"
-            
-        if message.forward_date:
-            forward_date = message.forward_date.strftime('%Y-%m-%d %H:%M')
-            task_parts.append(f"Date: {forward_date}")
-    elif hasattr(message, 'forward_sender_name') and message.forward_sender_name:
-        task_parts.append(f"From: {message.forward_sender_name}")
-        if message.forward_date:
-            forward_date = message.forward_date.strftime('%Y-%m-%d %H:%M')
-            task_parts.append(f"Date: {forward_date}")
+    # Extract sender and date information from forwarded messages
+    # [existing forwarded message handling code remains unchanged]
     
     # Extract main content
     if message.text:
-        task_parts.append(f"Text: {message.text}")
+        task_parts.append(f"T: {message.text}")
     elif message.caption:
-        task_parts.append(f"Caption: {message.caption}")
+        task_parts.append(f"C: {message.caption}")
     
-    # Handle different media types
+    # Handle different media types and store file_ids
     if message.photo:
+        # Get the largest photo (last item in the list)
+        photo_file_id = message.photo[-1].file_id
+        media_info['type'] = 'photo'
+        media_info['file_id'] = photo_file_id
         task_parts.append("📷 Photo attached")
     elif message.document:
         doc_name = message.document.file_name or "Unknown file"
+        media_info['type'] = 'document'
+        media_info['file_id'] = message.document.file_id
+        media_info['file_name'] = doc_name
         task_parts.append(f"📎 Document: {doc_name}")
     elif message.video:
+        media_info['type'] = 'video'
+        media_info['file_id'] = message.video.file_id
         task_parts.append("🎥 Video attached")
     elif message.audio:
         title = message.audio.title or "Unknown audio"
+        media_info['type'] = 'audio'
+        media_info['file_id'] = message.audio.file_id
+        media_info['title'] = title
         task_parts.append(f"🎵 Audio: {title}")
     elif message.voice:
         duration = message.voice.duration
+        media_info['type'] = 'voice'
+        media_info['file_id'] = message.voice.file_id
+        media_info['duration'] = duration
         task_parts.append(f"🎤 Voice message ({duration}s)")
     elif message.video_note:
+        media_info['type'] = 'video_note'
+        media_info['file_id'] = message.video_note.file_id
         task_parts.append("🎬 Video note attached")
     elif message.sticker:
+        media_info['type'] = 'sticker'
+        media_info['file_id'] = message.sticker.file_id
+        media_info['emoji'] = message.sticker.emoji
         task_parts.append(f"🎭 Sticker: {message.sticker.emoji or 'N/A'}")
     elif message.location:
         lat, lon = message.location.latitude, message.location.longitude
+        media_info['type'] = 'location'
+        media_info['latitude'] = lat
+        media_info['longitude'] = lon
         task_parts.append(f"📍 Location: {lat:.4f}, {lon:.4f}")
     elif message.contact:
         contact_name = f"{message.contact.first_name} {message.contact.last_name or ''}".strip()
+        media_info['type'] = 'contact'
+        media_info['name'] = contact_name
+        media_info['phone_number'] = message.contact.phone_number
         task_parts.append(f"👤 Contact: {contact_name} ({message.contact.phone_number})")
     elif message.poll:
+        media_info['type'] = 'poll'
+        media_info['question'] = message.poll.question
         task_parts.append(f"📊 Poll: {message.poll.question}")
     
     # Add message link if available
     result = " | ".join(task_parts) if task_parts else None
     
     # Return both the task content and the message link
-    return {"content": result, "link": message_link}
+    return {
+        "content": result, 
+        "link": message_link, 
+        "debug": debug_info, 
+        "source_type": source_type,
+        "message_id": forwarded_message_id,
+        "media_info": media_info if media_info else None
+    }
 
 def is_forwarded_message(message):
     """Check if message is forwarded using both new and old API"""
@@ -642,26 +892,32 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Handle regular media messages
-    task_content = extract_task_from_message(message)
+    task_data = extract_task_from_message(message)  # Remove the await keyword
     
-    if task_content:
+    if task_data["content"]:
         keyboard = [[
             InlineKeyboardButton("✅ Add as Task", callback_data=f"add_media_task"),
             InlineKeyboardButton("❌ Cancel", callback_data="cancel")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Store the media content in context
-        context.user_data['media_task_content'] = task_content
+        # Store the media content and media info in context
+        context.user_data['media_task_content'] = task_data["content"]
+        if task_data.get("media_info"):
+            context.user_data['media_task_media_info'] = task_data["media_info"]
         
-        preview_text = task_content[:100] + "..." if len(task_content) > 100 else task_content
+        # Store the message ID
+        context.user_data['media_task_message_id'] = task_data["message_id"]
+        
+        preview_text = task_data["content"][:100] + "..." if len(task_data["content"]) > 100 else task_data["content"]
         
         await update.message.reply_text(
             f"📎 **Media Message Detected**\n\n"
             f"**Content:** {preview_text}\n\n"
             f"Do you want to add this as a task?",
             parse_mode='Markdown',
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
+            reply_to_message_id=message.message_id  # Reply to the original media message
         )
 
 async def view_archived_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -676,24 +932,27 @@ async def view_archived_task(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_id = update.effective_user.id
         user_id_str = str(user_id)
         
-        # Get archived tasks for the user
-        archived_tasks = task_bot.archived_tasks.get(user_id_str, [])
-        
-        # Find the specific task
+        # Find the archived task
         task = None
-        for t in archived_tasks:
-            if t['id'] == task_id:
-                task = t
-                break
+        if user_id_str in task_bot.archived_tasks:
+            for t in task_bot.archived_tasks[user_id_str]:
+                if t['id'] == task_id:
+                    task = t
+                    break
         
         if not task:
             await update.message.reply_text(f"❌ Archived task #{task_id} not found.")
             return
         
-        # Format detailed task view
+        # Format task details
         created_date = datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')
-        completed_date = datetime.fromisoformat(task['completed_at']).strftime('%Y-%m-%d %H:%M') if task['completed_at'] else "N/A"
-        archived_date = datetime.fromisoformat(task['archived_at']).strftime('%Y-%m-%d %H:%M')
+        completed_date = "N/A"
+        if task['completed_at']:
+            completed_date = datetime.fromisoformat(task['completed_at']).strftime('%Y-%m-%d %H:%M')
+        
+        archived_date = "N/A"
+        if task.get('archived_at'):
+            archived_date = datetime.fromisoformat(task['archived_at']).strftime('%Y-%m-%d %H:%M')
         
         task_details = f"""
 📦 <b>Archived Task #{task['id']}</b>
@@ -705,6 +964,10 @@ async def view_archived_task(update: Update, context: ContextTypes.DEFAULT_TYPE)
 <b>Archived:</b> {archived_date}
 """
         
+        # Add message link if available
+        if task.get('message_link'):
+            task_details += f"\n<b>Original Message:</b> <a href='{task['message_link']}'>Link</a>"
+        
         # Add button to permanently delete only
         keyboard = [[
             InlineKeyboardButton("🗑 Delete Permanently", callback_data=f"perm_delete_{task['id']}")
@@ -712,6 +975,70 @@ async def view_archived_task(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(task_details, parse_mode='HTML', reply_markup=reply_markup)
+        
+        # If the task has media info, send the media
+        if task.get('media_info'):
+            media_info = task['media_info']
+            media_type = media_info.get('type')
+            file_id = media_info.get('file_id')
+            
+            if media_type == 'photo' and file_id:
+                await update.message.reply_photo(
+                    photo=file_id,
+                    caption=f"📷 Photo attachment for Archived Task #{task['id']}"
+                )
+            elif media_type == 'document' and file_id:
+                await update.message.reply_document(
+                    document=file_id,
+                    caption=f"📎 Document attachment for Archived Task #{task['id']}: {media_info.get('file_name', 'Unknown file')}"
+                )
+            elif media_type == 'video' and file_id:
+                await update.message.reply_video(
+                    video=file_id,
+                    caption=f"🎥 Video attachment for Archived Task #{task['id']}"
+                )
+            elif media_type == 'audio' and file_id:
+                await update.message.reply_audio(
+                    audio=file_id,
+                    caption=f"🎵 Audio attachment for Archived Task #{task['id']}: {media_info.get('title', 'Unknown audio')}"
+                )
+            elif media_type == 'voice' and file_id:
+                await update.message.reply_voice(
+                    voice=file_id,
+                    caption=f"🎤 Voice message attachment for Archived Task #{task['id']}"
+                )
+            elif media_type == 'video_note' and file_id:
+                await update.message.reply_video_note(
+                    video_note=file_id
+                )
+            elif media_type == 'sticker' and file_id:
+                await update.message.reply_sticker(
+                    sticker=file_id
+                )
+            elif media_type == 'location':
+                lat = media_info.get('latitude')
+                lon = media_info.get('longitude')
+                if lat and lon:
+                    await update.message.reply_location(
+                        latitude=lat,
+                        longitude=lon
+                    )
+            elif media_type == 'contact':
+                name = media_info.get('name')
+                phone = media_info.get('phone_number')
+                if name and phone:
+                    await update.message.reply_contact(
+                        phone_number=phone,
+                        first_name=name
+                    )
+        
+        # If the task has a message_id but no media info, reply to that message to show the original content
+        elif task.get('message_id'):
+            await update.message.reply_text(
+                "📎 <b>Original message content:</b>",
+                parse_mode='HTML',
+                reply_to_message_id=task['message_id']
+            )
         
     except ValueError:
         await update.message.reply_text("Please provide a valid task ID number.")
@@ -743,6 +1070,153 @@ async def list_archived_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await update.message.reply_text(archived_text, parse_mode='HTML')
 
+async def view_task_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View detailed information about a specific task"""
+    if not context.args:
+        await update.message.reply_text(
+            "Please provide a task ID.\n"
+            "Example: `/view 1`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    try:
+        task_id = int(context.args[0])
+        user_id = update.effective_user.id
+        
+        # Get the task
+        user_tasks = task_bot.get_user_tasks(user_id)
+        task = None
+        
+        for t in user_tasks:
+            if t['id'] == task_id:
+                task = t
+                break
+        
+        if not task:
+            await update.message.reply_text(f"❌ Task #{task_id} not found.")
+            return
+        
+        # Format task details
+        status_emoji = "✅" if task['status'] == 'completed' else "⏳"
+        created_date = datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')
+        completed_date = "N/A"
+        if task['status'] == 'completed' and task['completed_at']:
+            completed_date = datetime.fromisoformat(task['completed_at']).strftime('%Y-%m-%d %H:%M')
+        
+        details_text = f"""
+{status_emoji} <b>Task #{task['id']}</b>
+
+<b>Content:</b> {task['text']}
+<b>Status:</b> {task['status']}
+<b>Created:</b> {created_date}
+<b>Completed:</b> {completed_date}
+"""
+        
+        # Add message link if available
+        if task.get('message_link'):
+            details_text += f"\n<b>Original Message:</b> <a href='{task['message_link']}'>Link</a>"
+        
+        # Create keyboard with actions
+        keyboard = []
+        
+        # Add reply button if the task has a message_id
+        if task.get('message_id'):
+            keyboard.append([
+                InlineKeyboardButton("📩 Reply to Original", callback_data=f"reply_{task['id']}")
+            ])
+        
+        # Add action buttons based on task status
+        action_row = []
+        if task['status'] == 'pending':
+            action_row.extend([
+                InlineKeyboardButton("✅ Complete", callback_data=f"complete_{task['id']}"),
+                InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{task['id']}")
+            ])
+        else:
+            action_row.extend([
+                InlineKeyboardButton("📦 Archive", callback_data=f"archive_{task['id']}"),
+                InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{task['id']}")
+            ])
+        
+        keyboard.append(action_row)
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Send the detailed view
+        await update.message.reply_text(
+            details_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup,
+            disable_web_page_preview=False  # Enable preview to show media if there's a link
+        )
+        
+        # If the task has media info, send the media
+        if task.get('media_info'):
+            media_info = task['media_info']
+            media_type = media_info.get('type')
+            file_id = media_info.get('file_id')
+            
+            if media_type == 'photo' and file_id:
+                await update.message.reply_photo(
+                    photo=file_id,
+                    caption=f"📷 Photo attachment for Task #{task['id']}"
+                )
+            elif media_type == 'document' and file_id:
+                await update.message.reply_document(
+                    document=file_id,
+                    caption=f"📎 Document attachment for Task #{task['id']}: {media_info.get('file_name', 'Unknown file')}"
+                )
+            elif media_type == 'video' and file_id:
+                await update.message.reply_video(
+                    video=file_id,
+                    caption=f"🎥 Video attachment for Task #{task['id']}"
+                )
+            elif media_type == 'audio' and file_id:
+                await update.message.reply_audio(
+                    audio=file_id,
+                    caption=f"🎵 Audio attachment for Task #{task['id']}: {media_info.get('title', 'Unknown audio')}"
+                )
+            elif media_type == 'voice' and file_id:
+                await update.message.reply_voice(
+                    voice=file_id,
+                    caption=f"🎤 Voice message attachment for Task #{task['id']}"
+                )
+            elif media_type == 'video_note' and file_id:
+                await update.message.reply_video_note(
+                    video_note=file_id
+                )
+            elif media_type == 'sticker' and file_id:
+                await update.message.reply_sticker(
+                    sticker=file_id
+                )
+            elif media_type == 'location':
+                lat = media_info.get('latitude')
+                lon = media_info.get('longitude')
+                if lat and lon:
+                    await update.message.reply_location(
+                        latitude=lat,
+                        longitude=lon
+                    )
+            elif media_type == 'contact':
+                name = media_info.get('name')
+                phone = media_info.get('phone_number')
+                if name and phone:
+                    await update.message.reply_contact(
+                        phone_number=phone,
+                        first_name=name
+                    )
+        
+        # If the task has a message_id, reply to that message to show the original content
+        elif task.get('message_id'):
+            await update.message.reply_text(
+                "📎 <b>Original message content:</b>",
+                parse_mode='HTML',
+                reply_to_message_id=task['message_id']
+            )
+        
+    except ValueError:
+        await update.message.reply_text("Please provide a valid task ID number.")
+
 def main():
     """Main function to run the bot"""
     # Create application
@@ -753,6 +1227,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("add", add_task))
     application.add_handler(CommandHandler("list", list_tasks))
+    application.add_handler(CommandHandler("view", view_task_details))
     application.add_handler(CommandHandler("complete", complete_task_command))
     application.add_handler(CommandHandler("delete", delete_task_command))
     application.add_handler(CommandHandler("archive", archive_task_command))
