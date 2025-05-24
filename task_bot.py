@@ -3,7 +3,7 @@ from datetime import datetime
 import json
 import os
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 # Load environment variables
@@ -12,9 +12,16 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG  # Make sure this is INFO or DEBUG
+    level=logging.INFO  # Set base level to INFO
 )
+# Set debug level only for your application code
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Set higher levels for third-party libraries to reduce noise
+logging.getLogger('telegram').setLevel(logging.INFO)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # Bot token from environment variable
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -231,14 +238,12 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-async def create_task_list_message(user_id):
-    """Create a formatted task list message with buttons
-    
-    This helper function is used by both the /list command and the "Back to List" button
-    to ensure consistent formatting.
+async def create_task_list_message(user_id, page=0):
+    """Create a formatted task list message with navigation buttons
     
     Args:
         user_id: The user ID to get tasks for
+        page: The page number (0-based) to display
         
     Returns:
         tuple: (message_text, reply_markup) for the task list
@@ -248,69 +253,72 @@ async def create_task_list_message(user_id):
     if not tasks:
         return "📝 You have no tasks yet. Use /add to create one!", None
     
-    # Create inline keyboard for task actions
-    keyboard = []
-    task_text = "📋 *Your Tasks:*\n\n"
+    # Calculate pagination
+    tasks_per_page = 8
+    total_pages = (len(tasks) + tasks_per_page - 1) // tasks_per_page
+    page = max(0, min(page, total_pages - 1))  # Ensure page is in valid range
     
-    for task in tasks:
+    start_idx = page * tasks_per_page
+    end_idx = min(start_idx + tasks_per_page, len(tasks))
+    current_tasks = tasks[start_idx:end_idx]
+    
+    # Create task list text
+    task_text = f"📋 *Your Tasks* (Page {page+1}/{total_pages}):\n\n"
+    
+    for task in current_tasks:
         status_emoji = "✅" if task['status'] == 'completed' else "⏳"
         created_date = datetime.fromisoformat(task['created_at']).strftime('%m/%d')
         
-        # Get a short preview of the task text (first line or first 50 chars)
-        task_preview = task['text'].split('\n')[0][:50] + ('...' if len(task['text'].split('\n')[0]) > 50 else '')
+        # Get a short preview of the task text (first line or first 120 chars) (TODO: use contant variable instead)
+        task_preview = task['text'].split('\n')[0][:120] + ('...' if len(task['text'].split('\n')[0]) > 120 else '')
         
         # Add task header with ID and preview
         task_text += f"{status_emoji} *#{task['id']}* {task_preview}\n"
         
-        # Add description if task text is longer than the preview
-        if len(task['text']) > 50:
-            description = task['text'][50:200] + ('...' if len(task['text']) > 200 else '')
-            task_text += f" {description}\n"
-        
         # Add date info and attachment indicator
         attachment_indicator = ""
         if task.get('media_info') or task.get('message_link'):
-            attachment_indicator = " with attachments"
+            attachment_indicator = " 📎"
         
-        task_text += f"   📅 Created: {created_date}{attachment_indicator}"
+        task_text += f"   📅 {created_date}{attachment_indicator}"
         
         if task['status'] == 'completed' and task['completed_at']:
             completed_date = datetime.fromisoformat(task['completed_at']).strftime('%m/%d')
             task_text += f" → ✅ {completed_date}"
         
         task_text += "\n\n"
-        
-        # Create a row of buttons for this task (up to 4 columns)
-        task_row = []
-        
-        # Add view button
-        task_row.append(
-            InlineKeyboardButton(f"🔍 #{task['id']}", callback_data=f"view_{task['id']}")
+    
+    # Create navigation keyboard
+    keyboard = []
+    
+    # Add view buttons for each task
+    task_buttons = []
+    for task in current_tasks:
+        task_buttons.append(
+            InlineKeyboardButton(f"🔍{task['id']}", callback_data=f"view_{task['id']}")
         )
         
-        # Add reply button if the task has a message_id
-        if task.get('message_id'):
-            task_row.append(
-                InlineKeyboardButton(f"📩 #{task['id']}", callback_data=f"reply_{task['id']}")
-            )
-        
-        # Add action buttons based on task status
-        if task['status'] == 'pending':
-            task_row.append(
-                InlineKeyboardButton(f"✅ #{task['id']}", callback_data=f"complete_{task['id']}")
-            )
-        else:
-            task_row.append(
-                InlineKeyboardButton(f"📦 #{task['id']}", callback_data=f"archive_{task['id']}")
-            )
-        
-        # Add delete button
-        task_row.append(
-            InlineKeyboardButton(f"🗑 #{task['id']}", callback_data=f"delete_{task['id']}")
-        )
-        
-        # Add the row to the keyboard
-        keyboard.append(task_row)
+        # Create rows with 8 buttons each TODO use constant instead
+        if len(task_buttons) == 8:
+            keyboard.append(task_buttons)
+            task_buttons = []
+    
+    # Add any remaining buttons
+    if task_buttons:
+        keyboard.append(task_buttons)
+    
+    # Add navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"list_page_{page-1}"))
+    
+    nav_row.append(InlineKeyboardButton("🔄 Refresh", callback_data=f"list_page_{page}"))
+    
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"list_page_{page+1}"))
+    
+    if nav_row:
+        keyboard.append(nav_row)
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -319,8 +327,9 @@ async def create_task_list_message(user_id):
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List tasks command handler"""
     user_id = update.effective_user.id
+    page = 0  # Start with first page
     
-    task_text, reply_markup = await create_task_list_message(user_id)
+    task_text, reply_markup = await create_task_list_message(user_id, page)
     
     await update.message.reply_text(
         task_text,
@@ -424,15 +433,42 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
     
-    # Handle list tasks button
-    if data == "list_tasks":
-        task_text, reply_markup = await create_task_list_message(user_id)
+    # Handle paginated list
+    if data.startswith("list_page_"):
+        page = int(data.split("_")[-1])
+        task_text, reply_markup = await create_task_list_message(user_id, page)
         
-        await query.edit_message_text(
-            task_text,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
+        try:
+            await query.edit_message_text(
+                task_text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        except error.BadRequest as e:
+            # Handle "message is not modified" error silently
+            if "message is not modified" in str(e).lower():
+                # Just answer the callback query to show some response to the user
+                await query.answer("List is already up to date!")
+            else:
+                # Re-raise other BadRequest errors
+                raise
+    
+    # Handle list tasks button (back to first page)
+    elif data == "list_tasks":
+        task_text, reply_markup = await create_task_list_message(user_id, 0)
+        
+        try:
+            await query.edit_message_text(
+                task_text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        except error.BadRequest as e:
+            # Handle "message is not modified" error silently
+            if "message is not modified" in str(e).lower():
+                await query.answer("List is already up to date!")
+            else:
+                raise
     
     # Handle view task details
     if data.startswith('view_'):
