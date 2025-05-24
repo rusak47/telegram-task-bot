@@ -12,7 +12,7 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.DEBUG  # Make sure this is INFO or DEBUG
 )
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,9 @@ if not BOT_TOKEN:
 
 # File to store tasks
 TASKS_FILE = "tasks.json"
+
+last_forwarded_user_id = None
+pending_forwarded_messages = {}  # Dictionary to store pending messages by user_id
 
 class TaskBot:
     def __init__(self):
@@ -70,6 +73,9 @@ class TaskBot:
         if user_id_str not in self.tasks:
             self.tasks[user_id_str] = []
         
+        # Add debug logging
+        logger.info(f"Adding task with media_info: {media_info}")
+        
         task = {
             'id': len(self.tasks[user_id_str]) + 1,
             'text': task_text,
@@ -80,6 +86,9 @@ class TaskBot:
             'message_id': message_id,
             'media_info': media_info
         }
+        
+        # More debug logging
+        logger.info(f"Task created: {task}")
         
         self.tasks[user_id_str].append(task)
         self.save_tasks()
@@ -501,70 +510,54 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=False  # Enable preview to show media if there's a link
         )
         
-        # If the task has media info, send the media as a new message
+        # IMPORTANT: After editing the message, check for media and send it separately
+        logger.info(f"Checking for media in task #{task_id}")
+        
+        # If the task has media info, send the media as a separate message
         if task.get('media_info'):
             media_info = task['media_info']
-            media_type = media_info.get('type')
-            file_id = media_info.get('file_id')
+            logger.info(f"Found media_info in task #{task_id}: {media_info}")
             
-            if media_type == 'photo' and file_id:
-                await context.bot.send_photo(
-                    chat_id=query.message.chat_id,
-                    photo=file_id,
-                    caption=f"📷 Photo attachment for Task #{task['id']}"
-                )
-            elif media_type == 'document' and file_id:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=file_id,
-                    caption=f"📎 Document attachment for Task #{task['id']}: {media_info.get('file_name', 'Unknown file')}"
-                )
-            elif media_type == 'video' and file_id:
-                await context.bot.send_video(
-                    chat_id=query.message.chat_id,
-                    video=file_id,
-                    caption=f"🎥 Video attachment for Task #{task['id']}"
-                )
-            elif media_type == 'audio' and file_id:
-                await context.bot.send_audio(
-                    chat_id=query.message.chat_id,
-                    audio=file_id,
-                    caption=f"🎵 Audio attachment for Task #{task['id']}: {media_info.get('title', 'Unknown audio')}"
-                )
-            elif media_type == 'voice' and file_id:
-                await context.bot.send_voice(
-                    chat_id=query.message.chat_id,
-                    voice=file_id,
-                    caption=f"🎤 Voice message attachment for Task #{task['id']}"
-                )
-            elif media_type == 'video_note' and file_id:
-                await context.bot.send_video_note(
-                    chat_id=query.message.chat_id,
-                    video_note=file_id
-                )
-            elif media_type == 'sticker' and file_id:
-                await context.bot.send_sticker(
-                    chat_id=query.message.chat_id,
-                    sticker=file_id
-                )
-            elif media_type == 'location':
-                lat = media_info.get('latitude')
-                lon = media_info.get('longitude')
-                if lat and lon:
-                    await context.bot.send_location(
-                        chat_id=query.message.chat_id,
-                        latitude=lat,
-                        longitude=lon
-                    )
-            elif media_type == 'contact':
-                name = media_info.get('name')
-                phone = media_info.get('phone_number')
-                if name and phone:
-                    await context.bot.send_contact(
-                        chat_id=query.message.chat_id,
-                        phone_number=phone,
-                        first_name=name
-                    )
+            # Send debug message
+            await query.message.reply_text(f"DEBUG: Found media: {media_info['type']}")
+            
+            # Handle multiple media items
+            if media_info.get('type') == 'multiple' and media_info.get('items'):
+                logger.info(f"Processing multiple media items: {len(media_info['items'])} items")
+                
+                # Send debug message
+                await query.message.reply_text(f"DEBUG: Found {len(media_info['items'])} media items")
+                
+                # Process each item
+                for i, item in enumerate(media_info['items'][:5]):
+                    logger.info(f"Processing item {i+1}: {item}")
+                    
+                    try:
+                        # Try to send the media directly
+                        if item.get('type') == 'photo' and item.get('file_id'):
+                            logger.info(f"Sending photo with file_id: {item['file_id'][:15]}...")
+                            await query.message.reply_photo(
+                                photo=item['file_id'],
+                                caption=f"Attachment {i+1} for Task #{task_id}"
+                            )
+                            logger.info("Photo sent successfully")
+                        else:
+                            # Use the helper function for other types
+                            await send_media_item(query.message, item, f"Attachment {i+1} for Task #{task_id}")
+                    except Exception as e:
+                        error_msg = f"Error sending media item {i+1}: {str(e)}"
+                        logger.error(error_msg)
+                        await query.message.reply_text(f"❌ {error_msg}")
+            else:
+                # Handle single media item
+                logger.info(f"Processing single media item: {media_info}")
+                try:
+                    await send_media_item(query.message, media_info, f"Attachment for Task #{task_id}")
+                    logger.info("Media sent successfully")
+                except Exception as e:
+                    error_msg = f"Error sending media: {str(e)}"
+                    logger.error(error_msg)
+                    await query.message.reply_text(f"❌ {error_msg}")
         
         # If the task has a message_id, send a new message as a reply to the original
         elif task.get('message_id'):
@@ -698,58 +691,127 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle forwarded messages and convert to tasks"""
+    global last_forwarded_user_id, pending_forwarded_messages
+    
     message = update.message
+    user_id = update.effective_user.id
+    user_id_str = str(user_id)
+    
+    # Initialize user's pending messages if not exists
+    if user_id_str not in pending_forwarded_messages:
+        pending_forwarded_messages[user_id_str] = {
+            "messages": [],
+            "last_time": None
+        }
     
     # Extract task content from forwarded message
-    task_data = extract_task_from_message(message)  # Remove the await keyword
+    task_data = extract_task_from_message(message)
     
-    if not task_data["content"]:
-        await update.message.reply_text("❌ Could not extract task content from forwarded message.")
+    # Check if this is a continuation of previous forwarded messages (within 30 seconds)
+    current_time = datetime.now()
+    is_continuation = False
+    
+    if pending_forwarded_messages[user_id_str]["last_time"]:
+        time_diff = (current_time - pending_forwarded_messages[user_id_str]["last_time"]).total_seconds()
+        is_continuation = time_diff < 30  # Consider messages within 30 seconds as a batch
+    
+    # Update the last time
+    pending_forwarded_messages[user_id_str]["last_time"] = current_time
+    
+    # Add current message to pending messages
+    pending_forwarded_messages[user_id_str]["messages"].append(task_data)
+    
+    # If this is not a continuation or we have too many messages, process the batch
+    if not is_continuation or len(pending_forwarded_messages[user_id_str]["messages"]) >= 10:
+        await process_forwarded_messages_batch(update, context, user_id_str)
+    else:
+        # If it's a continuation, just acknowledge receipt
+        await update.message.reply_text(
+            "📨 *Message added to batch*\n"
+            "Forward more messages within 30 seconds to combine them, or wait to create a task.",
+            parse_mode='Markdown'
+        )
+
+async def process_forwarded_messages_batch(update, context, user_id_str):
+    """Process a batch of forwarded messages as a single task"""
+    global pending_forwarded_messages
+    
+    # Get all pending messages for this user
+    messages = pending_forwarded_messages[user_id_str]["messages"]
+    
+    if not messages:
         return
     
-    # Create inline keyboard for forwarded message
+    # Combine all message contents
+    combined_content = []
+    message_ids = []
+    media_infos = []
+    links = []
+    debug_info = []
+    
+    for msg_data in messages:
+        if msg_data["content"]:
+            combined_content.append(msg_data["content"])
+        if msg_data["message_id"]:
+            message_ids.append(msg_data["message_id"])
+        if msg_data["media_info"]:
+            media_infos.append(msg_data["media_info"])
+        if msg_data["link"]:
+            links.append(msg_data["link"])
+        if msg_data["debug"]:
+            debug_info.extend(msg_data["debug"])
+    
+    # Create combined task content
+    task_content = "\n---\n".join(combined_content)
+    
+    # Store only the first message ID as the reference
+    first_message_id = message_ids[0] if message_ids else None
+    
+    # Store only the first link
+    first_link = links[0] if links else None
+    
+    # Store all media info in a list
+    combined_media_info = None
+    if media_infos:
+        combined_media_info = {
+            "type": "multiple",
+            "items": media_infos
+        }
+    
+    # Create inline keyboard for forwarded message batch
     keyboard = [[
         InlineKeyboardButton("✅ Add as Task", callback_data=f"add_forwarded_task"),
         InlineKeyboardButton("❌ Cancel", callback_data="cancel")
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Store the forwarded content, link, message ID, and media info in context for later use
-    context.user_data['forwarded_task_content'] = task_data["content"]
-    if task_data["link"]:
-        context.user_data['forwarded_task_link'] = task_data["link"]
+    # Store the combined content in context
+    context.user_data['forwarded_task_content'] = task_content
+    if first_link:
+        context.user_data['forwarded_task_link'] = first_link
+    if first_message_id:
+        context.user_data['forwarded_message_id'] = first_message_id
+    if combined_media_info:
+        context.user_data['forwarded_media_info'] = combined_media_info
     
-    # Store the message ID of the forwarded message
-    context.user_data['forwarded_message_id'] = task_data["message_id"]
+    # Debug info
+    debug_text = "\n".join(debug_info[:10]) + (f"\n... and {len(debug_info) - 10} more" if len(debug_info) > 10 else "")
     
-    # Store media info if available
-    if task_data.get("media_info"):
-        context.user_data['forwarded_media_info'] = task_data["media_info"]
+    # Preview text
+    preview_text = task_content[:200] + "..." if len(task_content) > 200 else task_content
     
-    # Debug: Echo the message link and debug info
-    debug_text = "\n".join(task_data["debug"])
-    
+    # Send the combined message
     await update.message.reply_text(
-        f"🔍 *Debug Info:*\n```\n{debug_text}\n```\n\n"
-        f"🔗 *Link:* {task_data['link'] or 'None'}\n"
-        f"📩 *Message ID:* {task_data['message_id']}",
-        parse_mode='Markdown',
-        disable_web_page_preview=True
-    )
-    
-    preview_text = task_data["content"][:100] + "..." if len(task_data["content"]) > 100 else task_data["content"]
-    link_text = f"\n\n🔗 [Original Message]({task_data['link']})" if task_data["link"] else ""
-    
-    # Send the message as a reply to the original forwarded message
-    await update.message.reply_text(
-        f"📨 *Forwarded Message Detected*\n\n"
-        f"*Content Preview:*\n{preview_text}{link_text}\n\n"
-        f"Do you want to add this as a task?",
+        f"📨 *{len(messages)} Forwarded Messages Detected*\n\n"
+        f"*Content Preview:*\n{preview_text}\n\n"
+        f"Do you want to add these as a single task?",
         parse_mode='Markdown',
         reply_markup=reply_markup,
-        reply_to_message_id=message.message_id,  # Reply to the forwarded message
         disable_web_page_preview=True
     )
+    
+    # Clear the pending messages for this user
+    pending_forwarded_messages[user_id_str]["messages"] = []
 
 def extract_task_from_message(message):
     """Extract task content from various message types and save media file_ids"""
@@ -764,7 +826,75 @@ def extract_task_from_message(message):
     debug_info.append(f"Current message ID: {forwarded_message_id}")
     
     # Extract sender and date information from forwarded messages
-    # [existing forwarded message handling code remains unchanged]
+    if is_forwarded_message(message):
+        # Try to get sender info
+        sender_name = None
+        forward_date = None
+        
+        # New API (v20+)
+        if hasattr(message, 'forward_origin'):
+            origin = message.forward_origin
+            if hasattr(origin, 'sender_user') and origin.sender_user:
+                sender_name = origin.sender_user.first_name
+                if origin.sender_user.last_name:
+                    sender_name += f" {origin.sender_user.last_name}"
+                source_type = "user"
+            elif hasattr(origin, 'sender_chat') and origin.sender_chat:
+                sender_name = origin.sender_chat.title
+                source_type = "chat"
+            elif hasattr(origin, 'sender_name') and origin.sender_name:
+                sender_name = origin.sender_name
+                source_type = "hidden"
+            
+            if hasattr(origin, 'date'):
+                forward_date = origin.date
+        
+        # Old API (fallback)
+        else:
+            if message.forward_from:
+                sender_name = message.forward_from.first_name
+                if message.forward_from.last_name:
+                    sender_name += f" {message.forward_from.last_name}"
+                source_type = "user"
+            elif message.forward_from_chat:
+                sender_name = message.forward_from_chat.title
+                source_type = "chat"
+            elif message.forward_sender_name:
+                sender_name = message.forward_sender_name
+                source_type = "hidden"
+            
+            forward_date = message.forward_date
+        
+        # Format date if available
+        date_str = ""
+        if forward_date:
+            date_str = forward_date.strftime("%Y-%m-%d %H:%M")
+        
+        # Add sender and date to task parts
+        if sender_name:
+            task_parts.append(f"From: {sender_name}")
+        if date_str:
+            task_parts.append(f"Date: {date_str}")
+        
+        # Try to get message link for forwarded messages
+        if hasattr(message, 'forward_origin'):
+            origin = message.forward_origin
+            if hasattr(origin, 'chat') and origin.chat and hasattr(origin, 'message_id') and origin.message_id:
+                chat_id = origin.chat.id
+                message_id = origin.message_id
+                if str(chat_id).startswith('-100'):
+                    chat_id_str = str(chat_id)[4:]
+                    message_link = f"https://t.me/c/{chat_id_str}/{message_id}"
+                    debug_info.append(f"Generated link from origin: {message_link}")
+        
+        # Old API fallback for message link
+        elif message.forward_from_chat and message.forward_from_message_id:
+            chat_id = message.forward_from_chat.id
+            message_id = message.forward_from_message_id
+            if str(chat_id).startswith('-100'):
+                chat_id_str = str(chat_id)[4:]
+                message_link = f"https://t.me/c/{chat_id_str}/{message_id}"
+                debug_info.append(f"Generated link from forward_from_chat: {message_link}")
     
     # Extract main content
     if message.text:
@@ -817,15 +947,19 @@ def extract_task_from_message(message):
         media_info['longitude'] = lon
         task_parts.append(f"📍 Location: {lat:.4f}, {lon:.4f}")
     elif message.contact:
-        contact_name = f"{message.contact.first_name} {message.contact.last_name or ''}".strip()
+        name = message.contact.first_name
+        if message.contact.last_name:
+            name += f" {message.contact.last_name}"
+        phone = message.contact.phone_number
         media_info['type'] = 'contact'
-        media_info['name'] = contact_name
-        media_info['phone_number'] = message.contact.phone_number
-        task_parts.append(f"👤 Contact: {contact_name} ({message.contact.phone_number})")
+        media_info['name'] = name
+        media_info['phone_number'] = phone
+        task_parts.append(f"👤 Contact: {name} ({phone})")
     elif message.poll:
+        question = message.poll.question
         media_info['type'] = 'poll'
-        media_info['question'] = message.poll.question
-        task_parts.append(f"📊 Poll: {message.poll.question}")
+        media_info['question'] = question
+        task_parts.append(f"📊 Poll: {question}")
     
     # Add message link if available
     result = " | ".join(task_parts) if task_parts else None
@@ -979,66 +1113,30 @@ async def view_archived_task(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # If the task has media info, send the media
         if task.get('media_info'):
             media_info = task['media_info']
-            media_type = media_info.get('type')
-            file_id = media_info.get('file_id')
             
-            if media_type == 'photo' and file_id:
-                await update.message.reply_photo(
-                    photo=file_id,
-                    caption=f"📷 Photo attachment for Archived Task #{task['id']}"
-                )
-            elif media_type == 'document' and file_id:
-                await update.message.reply_document(
-                    document=file_id,
-                    caption=f"📎 Document attachment for Archived Task #{task['id']}: {media_info.get('file_name', 'Unknown file')}"
-                )
-            elif media_type == 'video' and file_id:
-                await update.message.reply_video(
-                    video=file_id,
-                    caption=f"🎥 Video attachment for Archived Task #{task['id']}"
-                )
-            elif media_type == 'audio' and file_id:
-                await update.message.reply_audio(
-                    audio=file_id,
-                    caption=f"🎵 Audio attachment for Archived Task #{task['id']}: {media_info.get('title', 'Unknown audio')}"
-                )
-            elif media_type == 'voice' and file_id:
-                await update.message.reply_voice(
-                    voice=file_id,
-                    caption=f"🎤 Voice message attachment for Archived Task #{task['id']}"
-                )
-            elif media_type == 'video_note' and file_id:
-                await update.message.reply_video_note(
-                    video_note=file_id
-                )
-            elif media_type == 'sticker' and file_id:
-                await update.message.reply_sticker(
-                    sticker=file_id
-                )
-            elif media_type == 'location':
-                lat = media_info.get('latitude')
-                lon = media_info.get('longitude')
-                if lat and lon:
-                    await update.message.reply_location(
-                        latitude=lat,
-                        longitude=lon
-                    )
-            elif media_type == 'contact':
-                name = media_info.get('name')
-                phone = media_info.get('phone_number')
-                if name and phone:
-                    await update.message.reply_contact(
-                        phone_number=phone,
-                        first_name=name
-                    )
+            # Handle multiple media items
+            if media_info.get('type') == 'multiple' and media_info.get('items'):
+                # Send up to 5 media items to avoid flooding
+                for i, item in enumerate(media_info['items'][:5]):
+                    if i >= 5:  # Limit to 5 attachments
+                        await update.message.reply_text(f"... and {len(media_info['items']) - 5} more attachments")
+                        break
+                    
+                    await send_media_item(update.message, item, f"Attachment {i+1} for Archived Task #{task['id']}")
+            else:
+                # Send single media item
+                await send_media_item(update.message, media_info, f"Attachment for Archived Task #{task['id']}")
         
         # If the task has a message_id but no media info, reply to that message to show the original content
         elif task.get('message_id'):
-            await update.message.reply_text(
-                "📎 <b>Original message content:</b>",
-                parse_mode='HTML',
-                reply_to_message_id=task['message_id']
-            )
+            try:
+                await update.message.reply_text(
+                    "📎 <b>Original message content:</b>",
+                    parse_mode='HTML',
+                    reply_to_message_id=task['message_id']
+                )
+            except Exception as e:
+                await update.message.reply_text(f"❌ Could not reference original message: {str(e)}")
         
     except ValueError:
         await update.message.reply_text("Please provide a valid task ID number.")
@@ -1150,61 +1248,60 @@ async def view_task_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=False  # Enable preview to show media if there's a link
         )
         
+        # Debug prints
+        logger.info(f"DEBUG: Task #{task['id']} details sent, now checking for media")
+        logger.info(f"DEBUG: Task has media_info: {bool(task.get('media_info'))}")
+        if task.get('media_info'):
+            logger.info(f"DEBUG: Media info content: {task['media_info']}")
+        
+        # Add explicit debug for media handling
+        logger.info(f"Checking for media in task #{task['id']}")
+        
         # If the task has media info, send the media
         if task.get('media_info'):
             media_info = task['media_info']
-            media_type = media_info.get('type')
-            file_id = media_info.get('file_id')
+            logger.info(f"Found media_info in task #{task['id']}: {media_info}")
             
-            if media_type == 'photo' and file_id:
-                await update.message.reply_photo(
-                    photo=file_id,
-                    caption=f"📷 Photo attachment for Task #{task['id']}"
-                )
-            elif media_type == 'document' and file_id:
-                await update.message.reply_document(
-                    document=file_id,
-                    caption=f"📎 Document attachment for Task #{task['id']}: {media_info.get('file_name', 'Unknown file')}"
-                )
-            elif media_type == 'video' and file_id:
-                await update.message.reply_video(
-                    video=file_id,
-                    caption=f"🎥 Video attachment for Task #{task['id']}"
-                )
-            elif media_type == 'audio' and file_id:
-                await update.message.reply_audio(
-                    audio=file_id,
-                    caption=f"🎵 Audio attachment for Task #{task['id']}: {media_info.get('title', 'Unknown audio')}"
-                )
-            elif media_type == 'voice' and file_id:
-                await update.message.reply_voice(
-                    voice=file_id,
-                    caption=f"🎤 Voice message attachment for Task #{task['id']}"
-                )
-            elif media_type == 'video_note' and file_id:
-                await update.message.reply_video_note(
-                    video_note=file_id
-                )
-            elif media_type == 'sticker' and file_id:
-                await update.message.reply_sticker(
-                    sticker=file_id
-                )
-            elif media_type == 'location':
-                lat = media_info.get('latitude')
-                lon = media_info.get('longitude')
-                if lat and lon:
-                    await update.message.reply_location(
-                        latitude=lat,
-                        longitude=lon
-                    )
-            elif media_type == 'contact':
-                name = media_info.get('name')
-                phone = media_info.get('phone_number')
-                if name and phone:
-                    await update.message.reply_contact(
-                        phone_number=phone,
-                        first_name=name
-                    )
+            # Send debug message to user
+            await update.message.reply_text(f"DEBUG: Found media: {media_info['type']}")
+            
+            # Handle multiple media items
+            if media_info.get('type') == 'multiple' and media_info.get('items'):
+                logger.info(f"Processing multiple media items: {len(media_info['items'])} items")
+                
+                # Send debug message to user
+                await update.message.reply_text(f"DEBUG: Found {len(media_info['items'])} media items")
+                
+                # Process each item
+                for i, item in enumerate(media_info['items'][:5]):
+                    logger.info(f"Processing item {i+1}: {item}")
+                    
+                    try:
+                        # Try to send the media directly
+                        if item.get('type') == 'photo' and item.get('file_id'):
+                            logger.info(f"Sending photo with file_id: {item['file_id'][:15]}...")
+                            await update.message.reply_photo(
+                                photo=item['file_id'],
+                                caption=f"Attachment {i+1} for Task #{task['id']}"
+                            )
+                            logger.info("Photo sent successfully")
+                        else:
+                            # Use the helper function for other types
+                            await send_media_item(update.message, item, f"Attachment {i+1} for Task #{task['id']}")
+                    except Exception as e:
+                        error_msg = f"Error sending media item {i+1}: {str(e)}"
+                        logger.error(error_msg)
+                        await update.message.reply_text(f"❌ {error_msg}")
+            else:
+                # Handle single media item
+                logger.info(f"Processing single media item: {media_info}")
+                try:
+                    await send_media_item(update.message, media_info, f"Attachment for Task #{task['id']}")
+                    logger.info("Media sent successfully")
+                except Exception as e:
+                    error_msg = f"Error sending media: {str(e)}"
+                    logger.error(error_msg)
+                    await update.message.reply_text(f"❌ {error_msg}")
         
         # If the task has a message_id, reply to that message to show the original content
         elif task.get('message_id'):
@@ -1216,6 +1313,119 @@ async def view_task_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except ValueError:
         await update.message.reply_text("Please provide a valid task ID number.")
+
+async def send_media_item(message, media_info, caption_prefix=""):
+    """Helper function to send a media item"""
+    media_type = media_info.get('type')
+    file_id = media_info.get('file_id')
+    
+    logger.info(f"Attempting to send media: type={media_type}, file_id={file_id[:15] if file_id else None}")
+    
+    if not media_type or not file_id:
+        logger.error(f"Media information is incomplete: {media_info}")
+        await message.reply_text(f"❌ Media information is incomplete: {media_info}")
+        return
+    
+    try:
+        if media_type == 'photo':
+            logger.info(f"Sending photo with file_id: {file_id[:15]}...")
+            await message.reply_photo(
+                photo=file_id,
+                caption=f"{caption_prefix}"
+            )
+        elif media_type == 'document':
+            # Other media types with logging
+            file_name = media_info.get('file_name', 'Unknown file')
+            logger.info(f"Sending document: {file_name} with file_id: {file_id[:15]}...")
+            await message.reply_document(
+                document=file_id,
+                caption=f"{caption_prefix}: {file_name}"
+            )
+        # Add logging to other media types similarly
+    except Exception as e:
+        error_msg = f"Error sending media: {str(e)}\nType: {media_type}, File ID: {file_id[:15]}..."
+        logger.error(error_msg)
+        await message.reply_text(f"❌ {error_msg}")
+
+async def send_media_item_bot(bot, chat_id, media_info, caption_prefix=""):
+    """Helper function to send a media item using the bot object
+    
+    Args:
+        bot: The bot object
+        chat_id: The chat ID to send the media to
+        media_info: The media info dictionary
+        caption_prefix: Optional prefix for the caption
+    """
+    media_type = media_info.get('type')
+    file_id = media_info.get('file_id')
+    
+    if not media_type or not file_id:
+        await bot.send_message(chat_id=chat_id, text="❌ Media information is incomplete")
+        return
+    
+    try:
+        if media_type == 'photo':
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=file_id,
+                caption=f"{caption_prefix}"
+            )
+        elif media_type == 'document':
+            file_name = media_info.get('file_name', 'Unknown file')
+            await bot.send_document(
+                chat_id=chat_id,
+                document=file_id,
+                caption=f"{caption_prefix}: {file_name}"
+            )
+        elif media_type == 'video':
+            await bot.send_video(
+                chat_id=chat_id,
+                video=file_id,
+                caption=f"{caption_prefix}"
+            )
+        elif media_type == 'audio':
+            title = media_info.get('title', 'Unknown audio')
+            await bot.send_audio(
+                chat_id=chat_id,
+                audio=file_id,
+                caption=f"{caption_prefix}: {title}"
+            )
+        elif media_type == 'voice':
+            await bot.send_voice(
+                chat_id=chat_id,
+                voice=file_id,
+                caption=f"{caption_prefix}"
+            )
+        elif media_type == 'video_note':
+            await bot.send_video_note(
+                chat_id=chat_id,
+                video_note=file_id
+            )
+        elif media_type == 'sticker':
+            await bot.send_sticker(
+                chat_id=chat_id,
+                sticker=file_id
+            )
+        elif media_type == 'location':
+            lat = media_info.get('latitude')
+            lon = media_info.get('longitude')
+            if lat and lon:
+                await bot.send_location(
+                    chat_id=chat_id,
+                    latitude=lat,
+                    longitude=lon
+                )
+        elif media_type == 'contact':
+            name = media_info.get('name')
+            phone = media_info.get('phone_number')
+            if name and phone:
+                await bot.send_contact(
+                    chat_id=chat_id,
+                    phone_number=phone,
+                    first_name=name
+                )
+    except Exception as e:
+        await bot.send_message(chat_id=chat_id, text=f"❌ Error sending media: {str(e)}")
 
 def main():
     """Main function to run the bot"""
