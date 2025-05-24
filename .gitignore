@@ -1,5 +1,5 @@
 /.env
-/archived_tasks.json
-/readme.md
-/tasks.json
 /venv
+/archived_tasks.json
+/tasks.json
+/username_mapping.json
