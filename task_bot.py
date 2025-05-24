@@ -1,10 +1,12 @@
-import logging
-from datetime import datetime
-import json
 import os
+import json
+import logging
+import re
+from datetime import datetime
+import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # Load environment variables
 load_dotenv()
@@ -41,9 +43,11 @@ USERNAME_MAPPING_FILE = "username_mapping.json"
 pending_add_attachments = {}  # Store pending attachments for users
 media_groups = {}  # Store media groups for processing
 username_to_id = {}  # Store username to user_id mappings
+media_group_timeout = 5  # Seconds to wait for all media in a group
 
 pending_forwarded_messages = {}  # Dictionary to store pending messages by user_id
 last_forwarded_user_id = None
+media_group_processing_delay = 2  # Seconds to wait before processing a media group
 
 def load_username_mappings():
     """Load username to user_id mappings from file"""
@@ -56,7 +60,7 @@ def load_username_mappings():
     except Exception as e:
         logger.error(f"Error loading username mappings: {e}")
         username_to_id = {}
-
+        
 def save_username_mappings():
     """Save username to user_id mappings to file"""
     try:
@@ -65,6 +69,18 @@ def save_username_mappings():
             logger.info(f"Saved {len(username_to_id)} username mappings")
     except Exception as e:
         logger.error(f"Error saving username mappings: {e}")
+
+def update_username_mapping(user):
+    """Update username to user_id mapping"""
+    if user and user.username:
+        user_id_str = str(user.id)
+        username = user.username
+        
+        # Check if mapping already exists or has changed
+        if user_id_str not in username_to_id or username_to_id[user_id_str] != username:
+            username_to_id[user_id_str] = username
+            logger.info(f"Updated username mapping: {username} -> {user_id_str}")
+            save_username_mappings()
 
 class TaskBot:
     def __init__(self):
@@ -254,8 +270,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command handler"""
     await start(update, context)
 
-async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add task command handler"""
+async def add_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new task"""
     user_id = update.effective_user.id
     user_id_str = str(user_id)
     
@@ -280,7 +296,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         await update.message.reply_text(
-            f"✅ Task added successfully with attachment!\n"
+            f"✅ Task added successfully!\n"
             f"*Task #{task['id']}:* {task['text']}\n"
             f"*Status:* {task['status']}\n"
             f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
@@ -289,6 +305,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Check if we're in attachment collection mode and have text
+    logger.debug(f"add_task_command called with args: {context.args}")
     if context.args and user_id_str in pending_add_attachments and pending_add_attachments[user_id_str]["active"]:
         task_text = ' '.join(context.args)
         
@@ -350,9 +367,8 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     await update.message.reply_text(
-        "📎 Please send attachments for your task.\n"
-        "You can send multiple photos, documents, or other media.\n"
-        "When finished, send `/add Your task text` to create the task.",
+        "📎 Send me attachments (photos, documents, etc.) and I'll collect them for a task.\n"
+        "When you're done, use `/add Your task text` to create the task with all attachments.",
         parse_mode='Markdown'
     )
 
@@ -544,14 +560,16 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stats_text, parse_mode='Markdown')
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button callbacks"""
+    """Handle button callbacks"""
     query = update.callback_query
     user_id = update.effective_user.id
+    user_id_str = str(user_id)
     
-    # Answer the callback query to remove the loading indicator
-    await query.answer()
-    
+    # Get the callback data
     data = query.data
+    
+    # Acknowledge the button press
+    await query.answer()
     
     # Handle media group task creation
     if data.startswith("add_media_group_"):
@@ -956,8 +974,8 @@ async def process_forwarded_messages_batch(update, context, user_id_str):
             message_ids.append(msg_data["message_id"])
         if msg_data["media_info"]:
             media_infos.append(msg_data["media_info"])
-        if msg_data["link"]:
-            links.append(msg_data["link"])
+        #if msg_data["link"]:
+        #    links.append(msg_data["link"])
         if msg_data["debug"]:
             debug_info.extend(msg_data["debug"])
     
@@ -977,6 +995,7 @@ async def process_forwarded_messages_batch(update, context, user_id_str):
             "type": "multiple",
             "items": media_infos
         }
+    logger.info(f"Processed batch for user {user_id_str}: {len(messages)} messages, media info: {combined_media_info is not None}")
     
     # Create inline keyboard for forwarded message batch
     keyboard = [[
@@ -996,7 +1015,8 @@ async def process_forwarded_messages_batch(update, context, user_id_str):
     
     # Debug info
     debug_text = "\n".join(debug_info[:10]) + (f"\n... and {len(debug_info) - 10} more" if len(debug_info) > 10 else "")
-    
+    logger.debug(f"DEBUG: Forwarded message batch for user {user_id_str}:\n{debug_text}")
+
     # Preview text
     preview_text = task_content[:200] + "..." if len(task_content) > 200 else task_content
     
@@ -1161,16 +1181,15 @@ def extract_task_from_message(message):
         media_info['question'] = question
         task_parts.append(f"📊 Poll: {question}")
     
-    # Add message link if available
-    result = " | ".join(task_parts) if task_parts else None
+    # Combine all parts into a single task content
+    content = "\n".join(task_parts) if task_parts else ""
     
-    # Return both the task content and the message link
     return {
-        "content": result, 
+        "content": content,
         "link": message_link, 
         "debug": debug_info, 
         "source_type": source_type,
-        "message_id": forwarded_message_id,
+        "message_id": message.message_id,
         "media_info": media_info if media_info else None
     }
 
@@ -1189,15 +1208,18 @@ def is_forwarded_message(message):
     return False
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle regular text messages"""
+    """Handle text messages"""
     message = update.message
     text = message.text
     user_id = update.effective_user.id
     user_id_str = str(user_id)
     
+    # Update username mapping
+    update_username_mapping(update.effective_user)
+    
     # Check if we're expecting task text for a media group
     if context.user_data.get('expecting_task_text') and context.user_data.get('media_group_waiting'):
-        # Get the media info
+        # Get the pending media group
         media_info = context.user_data.get('pending_media_group')
         
         if media_info:
@@ -1260,165 +1282,58 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user_id = update.effective_user.id
     user_id_str = str(user_id)
-    
-    # Check if this is part of a media group (multiple photos/videos sent together)
+
+# Check if this is part of a media group (multiple photos/videos/documents sent together)
     media_group_id = message.media_group_id
     
-    # If this is part of a media group, handle it differently
-    if media_group_id:
-        # Extract media info
-        task_data = extract_task_from_message(message)
-        
-        if task_data.get("media_info"):
-            # Initialize media group if it doesn't exist
-            if media_group_id not in media_groups:
-                media_groups[media_group_id] = {
-                    "user_id": user_id_str,
-                    "items": [],
-                    "timestamp": datetime.now(),
-                    "processed": False,
-                    "chat_id": update.effective_chat.id,
-                    "message_id": message.message_id
-                }
-            
-            # Add to media group
-            media_groups[media_group_id]["items"].append(task_data["media_info"])
-            logger.info(f"Added media to group {media_group_id}, total: {len(media_groups[media_group_id]['items'])}")
-            
-            # Only respond once per media group to avoid multiple messages
-            if not media_groups[media_group_id]["processed"]:
-                media_groups[media_group_id]["processed"] = True
-                
-                # Try to use job queue if available, otherwise process immediately
-                if hasattr(context.application, 'job_queue') and context.application.job_queue:
-                    try:
-                        context.application.job_queue.run_once(
-                            process_media_group,
-                            3,  # 3 seconds delay
-                            data={
-                                "media_group_id": media_group_id,
-                                "chat_id": update.effective_chat.id,
-                                "message_id": message.message_id
-                            }
-                        )
-                        await update.message.reply_text(
-                            "📎 Processing media group...",
-                            reply_to_message_id=message.message_id
-                        )
-                    except Exception as e:
-                        logger.error(f"Error scheduling job: {e}")
-                        # Fall back to immediate processing
-                        await process_media_group_immediate(update, context, media_group_id)
-                else:
-                    # Process immediately if job queue is not available
-                    logger.info("Job queue not available, processing media group immediately")
-                    await process_media_group_immediate(update, context, media_group_id)
-            
-            return
+    # Debug logging for media group detection
+    logger.debug(f"Media message received: group_id={media_group_id}, type={get_media_type(message)}; {len(media_groups)}")
     
-    # Check if user is in attachment collection mode for /add
-    if user_id_str in pending_add_attachments and pending_add_attachments[user_id_str]["active"]:
-        # Extract media info
-        task_data = extract_task_from_message(message)
-        
-        if task_data.get("media_info"):
-            # Add to pending attachments
-            media_info = task_data["media_info"]
-            pending_add_attachments[user_id_str]["attachments"].append(media_info)
-            
-            # Log the media info for debugging
-            logger.info(f"Added media to pending attachments: {media_info['type']}")
-            logger.info(f"Current attachments count: {len(pending_add_attachments[user_id_str]['attachments'])}")
-            
-            # Update the last activity time
-            pending_add_attachments[user_id_str]["start_time"] = datetime.now()
-            
-            await update.message.reply_text(
-                f"📎 Attachment added! ({len(pending_add_attachments[user_id_str]['attachments'])} total)\n"
-                f"Send more attachments or use `/add Your task text` to create the task.",
-                parse_mode='Markdown'
-            )
-            return
-    
-    # Check if this is a forwarded media message
-    if is_forwarded_message(message):
-        await handle_forwarded_message(update, context)
-        return
-    
-    # Handle regular media messages
+    # Extract media info
     task_data = extract_task_from_message(message)
-    
-    if task_data["content"]:
-        keyboard = [[
-            InlineKeyboardButton("✅ Add as Task", callback_data=f"add_media_task"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Store the media content and media info in context
-        context.user_data['media_task_content'] = task_data["content"]
-        if task_data.get("media_info"):
-            context.user_data['media_task_media_info'] = task_data["media_info"]
-        
-        # Store the message ID
-        context.user_data['media_task_message_id'] = task_data["message_id"]
-        
-        preview_text = task_data["content"][:100] + "..." if len(task_data["content"]) > 100 else task_data["content"]
-        
-        await update.message.reply_text(
-            f"📎 **Media Message Detected**\n\n"
-            f"**Content:** {preview_text}\n\n"
-            f"Do you want to add this as a task?",
-            parse_mode='Markdown',
-            reply_markup=reply_markup,
-            reply_to_message_id=message.message_id
-        )
 
-async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
-    """Process a media group after all items have been received"""
-    job = context.job
-    data = job.data
-    media_group_id = data["media_group_id"]
-    chat_id = data["chat_id"]
-    message_id = data["message_id"]
-    
-    if media_group_id not in media_groups:
-        logger.error(f"Media group {media_group_id} not found")
-        return
-    
-    group_data = media_groups[media_group_id]
-    user_id_str = group_data["user_id"]
-    items = group_data["items"]
-    
-    logger.info(f"Processing media group {media_group_id} with {len(items)} items")
-    
-    # Check if user is in attachment collection mode
-    if user_id_str in pending_add_attachments and pending_add_attachments[user_id_str]["active"]:
-        # Add all items to pending attachments
-        for item in items:
-            pending_add_attachments[user_id_str]["attachments"].append(item)
-        
-        # Update the last activity time
+    if task_data.get("media_info"):
+        # Initialize user's pending attachments if not already active
+        if user_id_str not in pending_add_attachments:
+            pending_add_attachments[user_id_str] = {
+                "active": True,
+                "attachments": [],
+                "start_time": datetime.now()
+            }
+
+        # Add the media to the user's pending attachments
+        pending_add_attachments[user_id_str]["attachments"].append(task_data["media_info"])
         pending_add_attachments[user_id_str]["start_time"] = datetime.now()
-        
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"📎 Added {len(items)} attachments! ({len(pending_add_attachments[user_id_str]['attachments'])} total)\n"
-                 f"Send more attachments or use `/add Your task text` to create the task.",
+
+        # Notify the user about the collected attachment
+        await update.message.reply_text(
+            f"📎 Attachment added! ({len(pending_add_attachments[user_id_str]['attachments'])} total)\n"
+            f"Send more attachments or use `/add Your task text` to create the task.",
             parse_mode='Markdown'
         )
     else:
+        await update.message.reply_text("❌ Unable to process the media.")
+
+async def delayed_process_media_group(context, media_group_id, chat_id, message_id):
+    """Process a media group after a delay to ensure all items are collected"""
+    # Wait for a short time to collect all media items
+    await asyncio.sleep(media_group_processing_delay)
+    
+    try:
+        if media_group_id not in media_groups:
+            logger.error(f"Media group {media_group_id} not found after delay")
+            return
+        
+        group_data = media_groups[media_group_id]
+        user_id_str = group_data["user_id"]
+        items = group_data["items"]
+        
+        logger.info(f"Processing media group {media_group_id} with {len(items)} items")
+        
         # Create a combined media info object
         combined_media_info = {
             "type": "multiple",
             "items": items
-        }
-        
-        # Store in context for later use
-        # We need to use a unique key for this media group
-        context.bot_data[f"media_group_{media_group_id}"] = {
-            "media_info": combined_media_info,
-            "user_id": user_id_str
         }
         
         # Create keyboard for adding as task
@@ -1428,19 +1343,67 @@ async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        # Create a description of the media items
+        media_descriptions = []
+        for i, item in enumerate(items):
+            item_type = item.get('type', 'unknown')
+            if item_type == 'photo':
+                media_descriptions.append(f"{i+1}. 📷 Photo")
+            elif item_type == 'document':
+                file_name = item.get('file_name', 'Unknown file')
+                media_descriptions.append(f"{i+1}. 📎 Document: {file_name}")
+            elif item_type == 'audio':
+                duration = item.get('duration', 'Unknown duration')
+                title = item.get('title', 'Unknown audio')
+                media_descriptions.append(f"{i+1}. 🎵 Audio: {title} ({duration}s)")
+            elif item_type == 'voice':
+                duration = item.get('duration', 'Unknown duration')
+                media_descriptions.append(f"{i+1}. 🎤 Voice message ({duration}s)")
+            elif item_type == 'video_note':
+                media_descriptions.append(f"{i+1}. 🎬 Video note")
+            elif item_type == 'sticker':
+                media_descriptions.append(f"{i+1}. 🎭 Sticker")
+            elif item_type == 'location':
+                media_descriptions.append(f"{i+1}. 📍 Location")
+            elif item_type == 'contact':
+                name = item.get('name', 'Unknown contact')
+                media_descriptions.append(f"{i+1}. 👤 Contact: {name}")
+            else:
+                media_descriptions.append(f"{i+1}. Unknown media type: {item_type}")
+        
+        media_list = "\n".join(media_descriptions)
+        
+        # Store in context for later use
+        context.bot_data[f"media_group_{media_group_id}"] = {
+            "media_info": combined_media_info,
+            "user_id": user_id_str,
+            "timestamp": datetime.now()
+        }
+        
+        # Send the message with media group info
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"📎 **Media Group Detected**\n\n"
-                 f"**{len(items)} media items in this group**\n\n"
+                 f"**{len(items)} media items in this group:**\n"
+                 f"{media_list}\n\n"
                  f"Do you want to add these as a single task?",
             parse_mode='Markdown',
-            reply_markup=reply_markup,
-            reply_to_message_id=message_id
+            reply_markup=reply_markup
         )
-    
-    # Clean up the media group data
-    # We'll keep it for a bit in case we need it
-    # It will be cleaned up by the cleanup job if available
+        
+        # Clean up the media group after processing
+        # But keep the data in context.bot_data for the callback
+        del media_groups[media_group_id]
+        
+    except Exception as e:
+        logger.error(f"Error processing media group: {str(e)}")
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error processing media group: {str(e)}"
+            )
+        except:
+            pass
 
 async def process_media_group_immediate(update: Update, context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
     """Process a media group immediately without using job queue"""
@@ -1507,39 +1470,35 @@ async def process_media_group_immediate(update: Update, context: ContextTypes.DE
     # It will be cleaned up by the cleanup job if available
 
 # Add a function to process pending attachments
-def process_pending_attachments(user_id_str, task_text):
-    """Process pending attachments and create a task"""
+def process_pending_attachments(user_id_str, task_text=None):
+    """Process pending attachments for a user and return media info"""
     if user_id_str not in pending_add_attachments or not pending_add_attachments[user_id_str]["active"]:
-        logger.info(f"No pending attachments for user {user_id_str}")
         return None
     
     attachments = pending_add_attachments[user_id_str]["attachments"]
-    logger.info(f"Processing {len(attachments)} pending attachments for user {user_id_str}")
     
-    # No attachments collected
     if not attachments:
-        logger.info(f"No attachments collected for user {user_id_str}")
-        # Clear the pending state
+        # No attachments, reset the state
         pending_add_attachments[user_id_str]["active"] = False
         return None
     
-    # Create combined media info
-    combined_media_info = None
-    if len(attachments) > 1:
-        combined_media_info = {
+    # Create media info
+    media_info = None
+    if len(attachments) == 1:
+        # Single attachment
+        media_info = attachments[0]
+    else:
+        # Multiple attachments
+        media_info = {
             "type": "multiple",
             "items": attachments
         }
-        logger.info(f"Created multiple media info with {len(attachments)} items: {combined_media_info}")
-    else:
-        combined_media_info = attachments[0]
-        logger.info(f"Using single media info: {combined_media_info['type']}")
     
-    # Clear the pending state
+    # Reset the state
     pending_add_attachments[user_id_str]["active"] = False
     pending_add_attachments[user_id_str]["attachments"] = []
     
-    return combined_media_info
+    return media_info
 
 async def view_archived_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View specific archived task command handler"""
@@ -1828,9 +1787,64 @@ async def send_media_item(message, media_info, caption_prefix=""):
                 document=file_id,
                 caption=f"{caption_prefix}: {file_name}"
             )
-        # Add logging to other media types similarly
+        elif media_type == 'video':
+            logger.info(f"Sending video with file_id: {file_id[:15]}...")
+            await message.reply_video(
+                video=file_id,
+                caption=f"{caption_prefix}"
+            )
+        elif media_type == 'audio':
+            title = media_info.get('title', 'Unknown audio')
+            logger.info(f"Sending audio: {title} with file_id: {file_id[:15]}...")
+            await message.reply_audio(
+                audio=file_id,
+                caption=f"{caption_prefix}: {title}"
+            )
+        elif media_type == 'voice':
+            logger.info(f"Sending voice with file_id: {file_id[:15]}...")
+            await message.reply_voice(
+                voice=file_id,
+                caption=f"{caption_prefix}"
+            )
+        elif media_type == 'video_note':
+            logger.info(f"Sending video note with file_id: {file_id[:15]}...")
+            await message.reply_video_note(
+                video_note=file_id
+            )
+            # Video notes don't support captions, so send a separate message
+            await message.reply_text(f"{caption_prefix}")
+        elif media_type == 'sticker':
+            logger.info(f"Sending sticker with file_id: {file_id[:15]}...")
+            await message.reply_sticker(
+                sticker=file_id
+            )
+            # Stickers don't support captions, so send a separate message
+            await message.reply_text(f"{caption_prefix}")
+        elif media_type == 'location':
+            latitude = media_info.get('latitude')
+            longitude = media_info.get('longitude')
+            logger.info(f"Sending location: {latitude}, {longitude}...")
+            await message.reply_location(
+                latitude=latitude,
+                longitude=longitude
+            )
+            # Locations don't support captions, so send a separate message
+            await message.reply_text(f"{caption_prefix}")
+        elif media_type == 'contact':
+            name = media_info.get('name', 'Unknown contact')
+            phone_number = media_info.get('phone_number', '')
+            logger.info(f"Sending contact: {name}, {phone_number}...")
+            await message.reply_contact(
+                phone_number=phone_number,
+                first_name=name
+            )
+            # Contacts don't support captions, so send a separate message
+            await message.reply_text(f"{caption_prefix}: {name}")
+        else:
+            logger.warning(f"Unknown media type: {media_type}")
+            await message.reply_text(f"⚠️ Unknown media type: {media_type}")
     except Exception as e:
-        error_msg = f"Error sending media: {str(e)}\nType: {media_type}, File ID: {file_id[:15]}..."
+        error_msg = f"Error sending media: {str(e)}\nType: {media_type}, File ID: {file_id[:15] if file_id else 'None'}..."
         logger.error(error_msg)
         await message.reply_text(f"❌ {error_msg}")
 
@@ -1932,6 +1946,7 @@ async def add_task_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Get the sender's information
     sender_id = update.effective_user.id
+    
     sender_name = update.effective_user.first_name
     if update.effective_user.username:
         sender_name += f" (@{update.effective_user.username})"
@@ -2022,6 +2037,43 @@ async def cleanup_media_groups(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Cleaning up old media group data {key}")
         del context.bot_data[key]
 
+def has_media(message):
+    """Check if a message has any media content"""
+    return (
+        message.photo or 
+        message.document or 
+        message.video or 
+        message.audio or 
+        message.voice or 
+        message.video_note or 
+        message.sticker or 
+        message.location or 
+        message.contact
+    )
+    
+def get_media_type(message):
+    """Helper function to determine the type of media in a message"""
+    if message.photo:
+        return "photo"
+    elif message.document:
+        return "document"
+    elif message.video:
+        return "video"
+    elif message.audio:
+        return "audio"
+    elif message.voice:
+        return "voice"
+    elif message.video_note:
+        return "video_note"
+    elif message.sticker:
+        return "sticker"
+    elif message.location:
+        return "location"
+    elif message.contact:
+        return "contact"
+    else:
+        return "unknown"
+    
 def main():
     """Start the bot"""
     # Load environment variables
@@ -2036,7 +2088,7 @@ def main():
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("add", add_task))
+    application.add_handler(CommandHandler("add", add_task_command))
     application.add_handler(CommandHandler("list", list_tasks))
     application.add_handler(CommandHandler("view", view_task_details))
     application.add_handler(CommandHandler("complete", complete_task_command))
