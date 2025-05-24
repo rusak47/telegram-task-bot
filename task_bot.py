@@ -26,14 +26,45 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 # Bot token from environment variable
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
+
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found in environment variables. Please create a .env file with BOT_TOKEN=your_token_here")
 
 # File to store tasks
 TASKS_FILE = "tasks.json"
 
-last_forwarded_user_id = None
+# File to store username mappings
+USERNAME_MAPPING_FILE = "username_mapping.json"
+
+# Global variables
+pending_add_attachments = {}  # Store pending attachments for users
+media_groups = {}  # Store media groups for processing
+username_to_id = {}  # Store username to user_id mappings
+
 pending_forwarded_messages = {}  # Dictionary to store pending messages by user_id
+last_forwarded_user_id = None
+
+def load_username_mappings():
+    """Load username to user_id mappings from file"""
+    global username_to_id
+    try:
+        if os.path.exists(USERNAME_MAPPING_FILE):
+            with open(USERNAME_MAPPING_FILE, 'r') as f:
+                username_to_id = json.load(f)
+                logger.info(f"Loaded {len(username_to_id)} username mappings")
+    except Exception as e:
+        logger.error(f"Error loading username mappings: {e}")
+        username_to_id = {}
+
+def save_username_mappings():
+    """Save username to user_id mappings to file"""
+    try:
+        with open(USERNAME_MAPPING_FILE, 'w') as f:
+            json.dump(username_to_id, f)
+            logger.info(f"Saved {len(username_to_id)} username mappings")
+    except Exception as e:
+        logger.error(f"Error saving username mappings: {e}")
 
 class TaskBot:
     def __init__(self):
@@ -181,6 +212,12 @@ task_bot = TaskBot()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
+    # Store the user's username for future reference
+    user_id = update.effective_user.id
+    if update.effective_user.username:
+        username_to_id[str(user_id)] = update.effective_user.username
+        logger.info(f"Stored username mapping: {update.effective_user.username} -> {user_id}")
+    
     welcome_text = """
 🤖 <b>Task Recording Bot</b>
 
@@ -188,6 +225,7 @@ Welcome! I can help you manage your tasks.
 
 <b>Available commands:</b>
 /add &lt;task&gt; - Add a new task
+/addfor @username &lt;task&gt; - Add a task for another user
 /list - Show all your tasks
 /view &lt;task_id&gt; - View task details
 /complete &lt;task_id&gt; - Mark task as completed
@@ -205,6 +243,7 @@ Welcome! I can help you manage your tasks.
 
 <b>Example:</b>
 <code>/add Buy groceries</code>
+<code>/addfor @friend Pick up package</code>
 <code>/view 1</code>
 <code>/complete 1</code>
 <code>/archive 1</code>
@@ -217,24 +256,103 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add task command handler"""
-    if not context.args:
+    user_id = update.effective_user.id
+    user_id_str = str(user_id)
+    
+    # Check if this is a reply to a message with media
+    if update.message.reply_to_message and has_media(update.message.reply_to_message):
+        # Extract task content from the replied message
+        task_data = extract_task_from_message(update.message.reply_to_message)
+        
+        # Use command args as task text, or the extracted content if no args
+        if context.args:
+            task_text = ' '.join(context.args)
+        else:
+            task_text = task_data["content"] or "Task from media"
+        
+        # Add the task with media info
+        task = task_bot.add_task(
+            user_id, 
+            task_text, 
+            None, 
+            task_data.get("message_id"), 
+            task_data.get("media_info")
+        )
+        
         await update.message.reply_text(
-            "Please provide a task description.\n"
-            "Example: `/add Buy groceries`",
+            f"✅ Task added successfully with attachment!\n"
+            f"*Task #{task['id']}:* {task['text']}\n"
+            f"*Status:* {task['status']}\n"
+            f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
             parse_mode='Markdown'
         )
         return
     
-    task_text = ' '.join(context.args)
-    user_id = update.effective_user.id
+    # Check if we're in attachment collection mode and have text
+    if context.args and user_id_str in pending_add_attachments and pending_add_attachments[user_id_str]["active"]:
+        task_text = ' '.join(context.args)
+        
+        # Process pending attachments
+        media_info = process_pending_attachments(user_id_str, task_text)
+        
+        # Add task with attachments
+        logger.info(f"Creating task with collected attachments. Media info: {media_info}")
+        task = task_bot.add_task(user_id, task_text, None, None, media_info)
+        
+        # Determine attachment count for message
+        attachment_count = "no"
+        if media_info:
+            if media_info.get('type') == 'multiple' and media_info.get('items'):
+                attachment_count = str(len(media_info['items']))
+            else:
+                attachment_count = "1"
+        
+        await update.message.reply_text(
+            f"✅ Task added successfully with {attachment_count} attachment(s)!\n"
+            f"*Task #{task['id']}:* {task['text']}\n"
+            f"*Status:* {task['status']}\n"
+            f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
+            parse_mode='Markdown'
+        )
+        return
     
-    task = task_bot.add_task(user_id, task_text)
+    # Regular task addition (no media)
+    if context.args:
+        task_text = ' '.join(context.args)
+        task = task_bot.add_task(user_id, task_text)
+        
+        await update.message.reply_text(
+            f"✅ Task added successfully!\n"
+            f"*Task #{task['id']}:* {task['text']}\n"
+            f"*Status:* {task['status']}\n"
+            f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # If no args provided, check if we're in attachment collection mode
+    if user_id_str in pending_add_attachments and pending_add_attachments[user_id_str]["active"]:
+        # Already collecting attachments, show status
+        attachments = pending_add_attachments[user_id_str]["attachments"]
+        await update.message.reply_text(
+            f"📎 Currently collecting attachments for a new task.\n"
+            f"*Attachments so far:* {len(attachments)}\n\n"
+            f"Send more attachments or use `/add Your task text` to create the task.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Start attachment collection mode
+    pending_add_attachments[user_id_str] = {
+        "active": True,
+        "attachments": [],
+        "start_time": datetime.now()
+    }
     
     await update.message.reply_text(
-        f"✅ Task added successfully!\n"
-        f"*Task #{task['id']}:* {task['text']}\n"
-        f"*Status:* {task['status']}\n"
-        f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
+        "📎 Please send attachments for your task.\n"
+        "You can send multiple photos, documents, or other media.\n"
+        "When finished, send `/add Your task text` to create the task.",
         parse_mode='Markdown'
     )
 
@@ -428,10 +546,56 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline button callbacks"""
     query = update.callback_query
+    user_id = update.effective_user.id
+    
+    # Answer the callback query to remove the loading indicator
     await query.answer()
     
-    user_id = update.effective_user.id
     data = query.data
+    
+    # Handle media group task creation
+    if data.startswith("add_media_group_"):
+        media_group_id = data.replace("add_media_group_", "")
+        
+        if f"media_group_{media_group_id}" in context.bot_data:
+            group_data = context.bot_data[f"media_group_{media_group_id}"]
+            media_info = group_data["media_info"]
+            
+            # Ask for task text
+            context.user_data['pending_media_group'] = media_info
+            
+            await query.edit_message_text(
+                "📝 Please enter a description for this task:",
+                reply_markup=None
+            )
+            
+            # Set conversation state
+            context.user_data['expecting_task_text'] = True
+            context.user_data['media_group_waiting'] = True
+            
+            return
+    
+    # Handle add task with attachments
+    if data == "add_task_with_attachments":
+        if 'attachment_task_text' in context.user_data:
+            task_text = context.user_data['attachment_task_text']
+            media_info = context.user_data.get('attachment_media_info')
+            
+            task = task_bot.add_task(user_id, task_text, None, None, media_info)
+            
+            await query.edit_message_text(
+                f"✅ Task added successfully with {len(media_info['items']) if media_info.get('items') else 1} attachment(s)!\n"
+                f"*Task #{task['id']}:* {task['text'][:50]}{'...' if len(task['text']) > 50 else ''}\n"
+                f"*Status:* {task['status']}\n"
+                f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
+                parse_mode='Markdown'
+            )
+            
+            # Clear user data
+            if 'attachment_task_text' in context.user_data:
+                del context.user_data['attachment_task_text']
+            if 'attachment_media_info' in context.user_data:
+                del context.user_data['attachment_media_info']
     
     # Handle paginated list
     if data.startswith("list_page_"):
@@ -1025,36 +1189,156 @@ def is_forwarded_message(message):
     return False
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle plain text messages as potential tasks"""
-    if update.message.text and update.message.text.startswith('/'):
-        return  # Ignore commands
+    """Handle regular text messages"""
+    message = update.message
+    text = message.text
+    user_id = update.effective_user.id
+    user_id_str = str(user_id)
+    
+    # Check if we're expecting task text for a media group
+    if context.user_data.get('expecting_task_text') and context.user_data.get('media_group_waiting'):
+        # Get the media info
+        media_info = context.user_data.get('pending_media_group')
+        
+        if media_info:
+            # Create the task
+            task = task_bot.add_task(user_id, text, None, None, media_info)
+            
+            # Determine attachment count
+            attachment_count = "multiple"
+            if media_info.get('type') == 'multiple' and media_info.get('items'):
+                attachment_count = str(len(media_info['items']))
+            
+            await update.message.reply_text(
+                f"✅ Task added successfully with {attachment_count} attachment(s)!\n"
+                f"*Task #{task['id']}:* {task['text']}\n"
+                f"*Status:* {task['status']}\n"
+                f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
+                parse_mode='Markdown'
+            )
+            
+            # Clear the state
+            context.user_data.pop('expecting_task_text', None)
+            context.user_data.pop('media_group_waiting', None)
+            context.user_data.pop('pending_media_group', None)
+            
+            return
+    
+    # Check if this is an /add command after collecting attachments
+    if text and text.startswith('/add '):
+        # This will be handled by the CommandHandler, not here
+        return
     
     # Check if this is a forwarded message
-    if is_forwarded_message(update.message):
+    if is_forwarded_message(message):
         await handle_forwarded_message(update, context)
         return
     
-    # Handle regular text messages
-    if update.message.text:
-        # Ask user if they want to add this as a task
-        keyboard = [[
-            InlineKeyboardButton("✅ Add as Task", callback_data=f"add_regular_task"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Store the text content in context
-        context.user_data['regular_task_content'] = update.message.text
-        
-        await update.message.reply_text(
-            f"Do you want to add this as a task?\n\n**\"{update.message.text}\"**",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
+    # Regular text message handling - add as task
+    keyboard = [[
+        InlineKeyboardButton("✅ Add as Task", callback_data="add_text_task"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Store the text in context
+    context.user_data['text_task_content'] = text
+    
+    preview_text = text[:100] + "..." if len(text) > 100 else text
+    
+    await update.message.reply_text(
+        f"📝 **Text Message Detected**\n\n"
+        f"**Content:** {preview_text}\n\n"
+        f"Do you want to add this as a task?",
+        parse_mode='Markdown',
+        reply_markup=reply_markup,
+        reply_to_message_id=message.message_id
+    )
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle media messages (photos, documents, etc.) as potential tasks"""
     message = update.message
+    user_id = update.effective_user.id
+    user_id_str = str(user_id)
+    
+    # Check if this is part of a media group (multiple photos/videos sent together)
+    media_group_id = message.media_group_id
+    
+    # If this is part of a media group, handle it differently
+    if media_group_id:
+        # Extract media info
+        task_data = extract_task_from_message(message)
+        
+        if task_data.get("media_info"):
+            # Initialize media group if it doesn't exist
+            if media_group_id not in media_groups:
+                media_groups[media_group_id] = {
+                    "user_id": user_id_str,
+                    "items": [],
+                    "timestamp": datetime.now(),
+                    "processed": False,
+                    "chat_id": update.effective_chat.id,
+                    "message_id": message.message_id
+                }
+            
+            # Add to media group
+            media_groups[media_group_id]["items"].append(task_data["media_info"])
+            logger.info(f"Added media to group {media_group_id}, total: {len(media_groups[media_group_id]['items'])}")
+            
+            # Only respond once per media group to avoid multiple messages
+            if not media_groups[media_group_id]["processed"]:
+                media_groups[media_group_id]["processed"] = True
+                
+                # Try to use job queue if available, otherwise process immediately
+                if hasattr(context.application, 'job_queue') and context.application.job_queue:
+                    try:
+                        context.application.job_queue.run_once(
+                            process_media_group,
+                            3,  # 3 seconds delay
+                            data={
+                                "media_group_id": media_group_id,
+                                "chat_id": update.effective_chat.id,
+                                "message_id": message.message_id
+                            }
+                        )
+                        await update.message.reply_text(
+                            "📎 Processing media group...",
+                            reply_to_message_id=message.message_id
+                        )
+                    except Exception as e:
+                        logger.error(f"Error scheduling job: {e}")
+                        # Fall back to immediate processing
+                        await process_media_group_immediate(update, context, media_group_id)
+                else:
+                    # Process immediately if job queue is not available
+                    logger.info("Job queue not available, processing media group immediately")
+                    await process_media_group_immediate(update, context, media_group_id)
+            
+            return
+    
+    # Check if user is in attachment collection mode for /add
+    if user_id_str in pending_add_attachments and pending_add_attachments[user_id_str]["active"]:
+        # Extract media info
+        task_data = extract_task_from_message(message)
+        
+        if task_data.get("media_info"):
+            # Add to pending attachments
+            media_info = task_data["media_info"]
+            pending_add_attachments[user_id_str]["attachments"].append(media_info)
+            
+            # Log the media info for debugging
+            logger.info(f"Added media to pending attachments: {media_info['type']}")
+            logger.info(f"Current attachments count: {len(pending_add_attachments[user_id_str]['attachments'])}")
+            
+            # Update the last activity time
+            pending_add_attachments[user_id_str]["start_time"] = datetime.now()
+            
+            await update.message.reply_text(
+                f"📎 Attachment added! ({len(pending_add_attachments[user_id_str]['attachments'])} total)\n"
+                f"Send more attachments or use `/add Your task text` to create the task.",
+                parse_mode='Markdown'
+            )
+            return
     
     # Check if this is a forwarded media message
     if is_forwarded_message(message):
@@ -1062,7 +1346,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Handle regular media messages
-    task_data = extract_task_from_message(message)  # Remove the await keyword
+    task_data = extract_task_from_message(message)
     
     if task_data["content"]:
         keyboard = [[
@@ -1087,8 +1371,175 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Do you want to add this as a task?",
             parse_mode='Markdown',
             reply_markup=reply_markup,
-            reply_to_message_id=message.message_id  # Reply to the original media message
+            reply_to_message_id=message.message_id
         )
+
+async def process_media_group(context: ContextTypes.DEFAULT_TYPE):
+    """Process a media group after all items have been received"""
+    job = context.job
+    data = job.data
+    media_group_id = data["media_group_id"]
+    chat_id = data["chat_id"]
+    message_id = data["message_id"]
+    
+    if media_group_id not in media_groups:
+        logger.error(f"Media group {media_group_id} not found")
+        return
+    
+    group_data = media_groups[media_group_id]
+    user_id_str = group_data["user_id"]
+    items = group_data["items"]
+    
+    logger.info(f"Processing media group {media_group_id} with {len(items)} items")
+    
+    # Check if user is in attachment collection mode
+    if user_id_str in pending_add_attachments and pending_add_attachments[user_id_str]["active"]:
+        # Add all items to pending attachments
+        for item in items:
+            pending_add_attachments[user_id_str]["attachments"].append(item)
+        
+        # Update the last activity time
+        pending_add_attachments[user_id_str]["start_time"] = datetime.now()
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📎 Added {len(items)} attachments! ({len(pending_add_attachments[user_id_str]['attachments'])} total)\n"
+                 f"Send more attachments or use `/add Your task text` to create the task.",
+            parse_mode='Markdown'
+        )
+    else:
+        # Create a combined media info object
+        combined_media_info = {
+            "type": "multiple",
+            "items": items
+        }
+        
+        # Store in context for later use
+        # We need to use a unique key for this media group
+        context.bot_data[f"media_group_{media_group_id}"] = {
+            "media_info": combined_media_info,
+            "user_id": user_id_str
+        }
+        
+        # Create keyboard for adding as task
+        keyboard = [[
+            InlineKeyboardButton("✅ Add as Task", callback_data=f"add_media_group_{media_group_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📎 **Media Group Detected**\n\n"
+                 f"**{len(items)} media items in this group**\n\n"
+                 f"Do you want to add these as a single task?",
+            parse_mode='Markdown',
+            reply_markup=reply_markup,
+            reply_to_message_id=message_id
+        )
+    
+    # Clean up the media group data
+    # We'll keep it for a bit in case we need it
+    # It will be cleaned up by the cleanup job if available
+
+async def process_media_group_immediate(update: Update, context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
+    """Process a media group immediately without using job queue"""
+    if media_group_id not in media_groups:
+        logger.error(f"Media group {media_group_id} not found")
+        return
+    
+    group_data = media_groups[media_group_id]
+    user_id_str = group_data["user_id"]
+    items = group_data["items"]
+    chat_id = group_data["chat_id"]
+    message_id = group_data["message_id"]
+    
+    logger.info(f"Processing media group {media_group_id} immediately with {len(items)} items")
+    
+    # Check if user is in attachment collection mode
+    if user_id_str in pending_add_attachments and pending_add_attachments[user_id_str]["active"]:
+        # Add all items to pending attachments
+        for item in items:
+            pending_add_attachments[user_id_str]["attachments"].append(item)
+        
+        # Update the last activity time
+        pending_add_attachments[user_id_str]["start_time"] = datetime.now()
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📎 Added {len(items)} attachments! ({len(pending_add_attachments[user_id_str]['attachments'])} total)\n"
+                 f"Send more attachments or use `/add Your task text` to create the task.",
+            parse_mode='Markdown'
+        )
+    else:
+        # Create a combined media info object
+        combined_media_info = {
+            "type": "multiple",
+            "items": items
+        }
+        
+        # Store in context for later use
+        # We need to use a unique key for this media group
+        context.bot_data[f"media_group_{media_group_id}"] = {
+            "media_info": combined_media_info,
+            "user_id": user_id_str
+        }
+        
+        # Create keyboard for adding as task
+        keyboard = [[
+            InlineKeyboardButton("✅ Add as Task", callback_data=f"add_media_group_{media_group_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📎 **Media Group Detected**\n\n"
+                 f"**{len(items)} media items in this group**\n\n"
+                 f"Do you want to add these as a single task?",
+            parse_mode='Markdown',
+            reply_markup=reply_markup,
+            reply_to_message_id=message_id
+        )
+    
+    # Clean up the media group data
+    # We'll keep it for a bit in case we need it
+    # It will be cleaned up by the cleanup job if available
+
+# Add a function to process pending attachments
+def process_pending_attachments(user_id_str, task_text):
+    """Process pending attachments and create a task"""
+    if user_id_str not in pending_add_attachments or not pending_add_attachments[user_id_str]["active"]:
+        logger.info(f"No pending attachments for user {user_id_str}")
+        return None
+    
+    attachments = pending_add_attachments[user_id_str]["attachments"]
+    logger.info(f"Processing {len(attachments)} pending attachments for user {user_id_str}")
+    
+    # No attachments collected
+    if not attachments:
+        logger.info(f"No attachments collected for user {user_id_str}")
+        # Clear the pending state
+        pending_add_attachments[user_id_str]["active"] = False
+        return None
+    
+    # Create combined media info
+    combined_media_info = None
+    if len(attachments) > 1:
+        combined_media_info = {
+            "type": "multiple",
+            "items": attachments
+        }
+        logger.info(f"Created multiple media info with {len(attachments)} items: {combined_media_info}")
+    else:
+        combined_media_info = attachments[0]
+        logger.info(f"Using single media info: {combined_media_info['type']}")
+    
+    # Clear the pending state
+    pending_add_attachments[user_id_str]["active"] = False
+    pending_add_attachments[user_id_str]["attachments"] = []
+    
+    return combined_media_info
 
 async def view_archived_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View specific archived task command handler"""
@@ -1463,12 +1914,126 @@ async def send_media_item_bot(bot, chat_id, media_info, caption_prefix=""):
     except Exception as e:
         await bot.send_message(chat_id=chat_id, text=f"❌ Error sending media: {str(e)}")
 
+async def add_task_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add task for another user by username"""
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "Please provide a username and task description.\n"
+            "Example: `/addfor @username Buy groceries`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Extract username (remove @ if present)
+    target_username = context.args[0].lstrip('@')
+    
+    # Extract task text (everything after the username)
+    task_text = ' '.join(context.args[1:])
+    
+    # Get the sender's information
+    sender_id = update.effective_user.id
+    sender_name = update.effective_user.first_name
+    if update.effective_user.username:
+        sender_name += f" (@{update.effective_user.username})"
+    
+    # Check if we know the target user's ID
+    target_id = None
+    for user_id, username in username_to_id.items():
+        if username.lower() == target_username.lower():
+            target_id = int(user_id)
+            break
+    
+    if not target_id:
+        await update.message.reply_text(
+            f"❌ User @{target_username} not found. They need to use this bot at least once before you can assign tasks to them.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Add sender information to the task
+    full_task_text = f"📨 From: {sender_name} | {task_text}"
+    
+    # Add the task for the target user
+    task = task_bot.add_task(target_id, full_task_text)
+    
+    # Notify the sender
+    await update.message.reply_text(
+        f"✅ Task added for @{target_username}!\n"
+        f"*Task #{task['id']}:* {task_text}\n"
+        f"*Status:* {task['status']}\n"
+        f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
+        parse_mode='Markdown'
+    )
+    
+    # Try to notify the target user if possible
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🔔 *New Task Assigned by {sender_name}*\n\n"
+                 f"*Task #{task['id']}:* {task_text}\n"
+                 f"*Status:* {task['status']}\n"
+                 f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}\n\n"
+                 f"Use /list to see all your tasks.",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify user {target_id}: {e}")
+
+async def cleanup_pending_attachments(context: ContextTypes.DEFAULT_TYPE):
+    """Cleanup pending attachments that are older than 30 minutes"""
+    current_time = datetime.now()
+    users_to_cleanup = []
+    
+    for user_id, data in pending_add_attachments.items():
+        if data["active"]:
+            time_diff = (current_time - data["start_time"]).total_seconds()
+            if time_diff > 1800:  # 30 minutes
+                users_to_cleanup.append(user_id)
+    
+    for user_id in users_to_cleanup:
+        pending_add_attachments[user_id]["active"] = False
+        pending_add_attachments[user_id]["attachments"] = []
+        logger.info(f"Cleaned up pending attachments for user {user_id}")
+
+async def cleanup_media_groups(context: ContextTypes.DEFAULT_TYPE):
+    """Clean up old media groups"""
+    now = datetime.now()
+    to_delete = []
+    
+    for media_group_id, group_data in media_groups.items():
+        # If the media group is older than 5 minutes, delete it
+        if (now - group_data["timestamp"]).total_seconds() > 300:
+            to_delete.append(media_group_id)
+    
+    for media_group_id in to_delete:
+        logger.info(f"Cleaning up old media group {media_group_id}")
+        del media_groups[media_group_id]
+    
+    # Also clean up bot_data
+    to_delete = []
+    for key in context.bot_data.keys():
+        if key.startswith("media_group_") and isinstance(context.bot_data[key], dict):
+            # If the key exists but doesn't have a timestamp, we'll use a default
+            timestamp = context.bot_data[key].get("timestamp", datetime.min)
+            if isinstance(timestamp, datetime) and (now - timestamp).total_seconds() > 300:
+                to_delete.append(key)
+    
+    for key in to_delete:
+        logger.info(f"Cleaning up old media group data {key}")
+        del context.bot_data[key]
+
 def main():
-    """Main function to run the bot"""
-    # Create application
+    """Start the bot"""
+    # Load environment variables
+    load_dotenv()
+    
+    # Load username mappings
+    load_username_mappings()
+    
+    # Create the Application with job queue enabled
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
+    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("add", add_task))
@@ -1477,11 +2042,13 @@ def main():
     application.add_handler(CommandHandler("complete", complete_task_command))
     application.add_handler(CommandHandler("delete", delete_task_command))
     application.add_handler(CommandHandler("archive", archive_task_command))
-    application.add_handler(CommandHandler("archived", view_archived_task))
-    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("archived", list_archived_tasks))
+    application.add_handler(CommandHandler("addfor", add_task_for_user))
+    
+    # Add callback query handler
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    # Handle different types of messages
+    # Add text message handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     # Handle media messages with more specific filters
@@ -1496,9 +2063,17 @@ def main():
     application.add_handler(MessageHandler(filters.CONTACT, handle_media))
     application.add_handler(MessageHandler(filters.POLL, handle_media))
     
-    # Start the bot
-    print("Bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Check if job queue is available and add the cleanup jobs
+    if hasattr(application, 'job_queue') and application.job_queue:
+        application.job_queue.run_repeating(cleanup_pending_attachments, interval=600, first=600)
+        application.job_queue.run_repeating(cleanup_media_groups, interval=300, first=300)
+        logger.info("Scheduled cleanup jobs")
+    else:
+        logger.warning("Job queue is not available, skipping cleanup jobs")
+        logger.warning("To use job queue, install PTB with: pip install 'python-telegram-bot[job-queue]'")
+    
+    # Start the Bot
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
