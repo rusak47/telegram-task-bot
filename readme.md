@@ -16,6 +16,9 @@ pip install python-telegram-bot python-dotenv
 # Save dependencies
 pip freeze > requirements.txt
 
+# Install dependencies
+pip install -r requirements.txt
+
 # Run bot
 python task_bot.py
 

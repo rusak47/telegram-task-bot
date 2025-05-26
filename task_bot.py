@@ -7,6 +7,7 @@ import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.helpers import escape_markdown
 
 # Load environment variables
 load_dotenv()
@@ -81,11 +82,16 @@ def update_username_mapping(user):
             username_to_id[user_id_str] = username
             logger.info(f"Updated username mapping: {username} -> {user_id_str}")
             save_username_mappings()
-
+            
+import time
 class TaskBot:
     def __init__(self):
         self.tasks = self.load_tasks()
         self.archived_tasks = self.load_archived_tasks()
+    
+    def get_next_task_id(self):
+        """Generate a unique task ID using the current timestamp"""
+        return int(time.time() * 1000)  # Milliseconds since epoch
     
     def load_tasks(self):
         """Load tasks from file"""
@@ -127,11 +133,14 @@ class TaskBot:
         if user_id_str not in self.tasks:
             self.tasks[user_id_str] = []
         
+        # Generate a unique task ID
+        task_id = self.get_next_task_id()
+    
         # Add debug logging
         logger.info(f"Adding task with media_info: {media_info}")
         
         task = {
-            'id': len(self.tasks[user_id_str]) + 1,
+            'id': task_id,
             'text': task_text,
             'status': 'pending',
             'created_at': datetime.now().isoformat(),
@@ -399,7 +408,7 @@ async def create_task_list_message(user_id, page=0):
     # Create task list text
     task_text = f"📋 *Your Tasks* (Page {page+1}/{total_pages}):\n\n"
     
-    for task in current_tasks:
+    for index, task in enumerate(current_tasks, start=1): 
         status_emoji = "✅" if task['status'] == 'completed' else "⏳"
         created_date = datetime.fromisoformat(task['created_at']).strftime('%m/%d')
         
@@ -407,7 +416,7 @@ async def create_task_list_message(user_id, page=0):
         task_preview = task['text'].split('\n')[0][:120] + ('...' if len(task['text'].split('\n')[0]) > 120 else '')
         
         # Add task header with ID and preview
-        task_text += f"{status_emoji} *#{task['id']}* {task_preview}\n"
+        task_text += f"{index}| {status_emoji} {task_preview}\n"
         
         # Add date info and attachment indicator
         attachment_indicator = ""
@@ -427,9 +436,9 @@ async def create_task_list_message(user_id, page=0):
     
     # Add view buttons for each task
     task_buttons = []
-    for task in current_tasks:
+    for index, task in enumerate(current_tasks, start=1): 
         task_buttons.append(
-            InlineKeyboardButton(f"🔍{task['id']}", callback_data=f"view_{task['id']}")
+            InlineKeyboardButton(f"🔍{index}", callback_data=f"view_{task['id']}")
         )
         
         # Create rows with 8 buttons each TODO use constant instead
@@ -492,6 +501,66 @@ async def complete_task_command(update: Update, context: ContextTypes.DEFAULT_TY
     except ValueError:
         await update.message.reply_text("Please provide a valid task ID number.")
 
+async def save_batch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Combine all batch-stored tasks into one task"""
+    user_id = update.effective_user.id
+    user_id_str = str(user_id)
+    
+    # Check if there are pending forwarded messages
+    forwarded_messages = pending_forwarded_messages.get(user_id_str, {}).get("messages", [])
+    attachments = pending_add_attachments.get(user_id_str, {}).get("attachments", [])
+    
+    if not forwarded_messages and not attachments:
+        await update.message.reply_text("❌ No pending batches to save.")
+        return
+    
+    # Combine forwarded messages
+    combined_content = []
+    media_infos = []
+    
+    if forwarded_messages:
+        for msg_data in forwarded_messages:
+            if msg_data["content"]:
+                combined_content.append(msg_data["content"])
+            if msg_data["media_info"]:
+                media_infos.append(msg_data["media_info"])
+        # Clear forwarded messages
+        pending_forwarded_messages[user_id_str]["messages"] = []
+    
+    # Combine attachments
+    if attachments:
+        if len(attachments) == 1:
+            media_infos.append(attachments[0])
+        else:
+            media_infos.append({
+                "type": "multiple",
+                "items": attachments
+            })
+        # Clear attachments
+        pending_add_attachments[user_id_str]["attachments"] = []
+        pending_add_attachments[user_id_str]["active"] = False
+    
+    # Create the combined task content
+    task_text = "\n---\n".join(combined_content) if combined_content else "Task from batch"
+    combined_media_info = {
+        "type": "multiple",
+        "items": media_infos
+    } if media_infos else None
+    
+    # Add the task
+    task = task_bot.add_task(user_id, task_text, None, None, combined_media_info)
+    
+    # Notify the user
+    attachment_count = len(media_infos) if combined_media_info else 0
+    await update.message.reply_text(
+        f"✅ Batch saved as a single task!\n"
+        f"*Task #{task['id']}:* {task['text'][:50]}{'...' if len(task['text']) > 50 else ''}\n"
+        f"*Attachments:* {attachment_count}\n"
+        f"*Status:* {task['status']}\n"
+        f"*Created:* {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M')}",
+        parse_mode='Markdown'
+    )
+    
 async def delete_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete task command handler"""
     if not context.args:
@@ -684,7 +753,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>Created:</b> {created_date}
 <b>Completed:</b> {completed_date}
 """
-        
+        # Show the old description if available
+        if 'previous_text' in task:
+            details_text += f"\n<b>Previous Description:</b> {task['previous_text']}"
+    
         # Add message link if available
         if task.get('message_link'):
             details_text += f"\n<b>Original Message:</b> <a href='{task['message_link']}'>Link</a>"
@@ -703,6 +775,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if task['status'] == 'pending':
             action_row.extend([
                 InlineKeyboardButton("✅ Complete", callback_data=f"complete_{task['id']}"),
+                InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{task['id']}"),    
                 InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{task['id']}")
             ])
         else:
@@ -818,6 +891,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text(f"❌ Task #{task_id} not found.")
     
+    if data.startswith('edit_'):
+        task_id = int(data.split('_')[1])
+        user_id_str = str(user_id)
+        
+        # Find the task
+        task = None
+        if user_id_str in task_bot.tasks:
+            for t in task_bot.tasks[user_id_str]:
+                if t['id'] == task_id:
+                    task = t
+                    break
+        
+        if not task:
+            await query.edit_message_text("❌ Task not found.")
+            return
+        
+        # Prompt the user for a new description
+        context.user_data['editing_task_id'] = task_id
+        await query.edit_message_text(
+            f"✏️ *Editing Task #{task_id}*\n\n"
+            f"Current Description:\n{task['text']}\n\n"
+            f"Please send the new description for this task.",
+            parse_mode='Markdown'
+        )
     # Handle task deletion
     elif data.startswith('delete_'):
         task_id = int(data.split('_')[1])
@@ -841,6 +938,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_link = context.user_data.get('forwarded_task_link')
             message_id = context.user_data.get('forwarded_message_id')
             media_info = context.user_data.get('forwarded_media_info')
+            media_info2 = process_pending_attachments(user_id_str, task_text)
+            logger.debug(f"atachements: {media_info2}")
             
             task = task_bot.add_task(user_id, task_text, message_link, message_id, media_info)
             
@@ -919,7 +1018,8 @@ async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT
     if user_id_str not in pending_forwarded_messages:
         pending_forwarded_messages[user_id_str] = {
             "messages": [],
-            "last_time": None
+            "last_time": None,
+            "start_time": datetime.now()
         }
     
     # Extract task content from forwarded message
@@ -927,16 +1027,14 @@ async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT
     
     # Check if this is a continuation of previous forwarded messages (within 30 seconds)
     current_time = datetime.now()
-    is_continuation = False
+    is_continuation = True
     
     if pending_forwarded_messages[user_id_str]["last_time"]:
         time_diff = (current_time - pending_forwarded_messages[user_id_str]["last_time"]).total_seconds()
         is_continuation = time_diff < 30  # Consider messages within 30 seconds as a batch
     
-    # Update the last time
+    # Add current message to pending messages and update access time
     pending_forwarded_messages[user_id_str]["last_time"] = current_time
-    
-    # Add current message to pending messages
     pending_forwarded_messages[user_id_str]["messages"].append(task_data)
     
     # If this is not a continuation or we have too many messages, process the batch
@@ -958,6 +1056,7 @@ async def process_forwarded_messages_batch(update, context, user_id_str):
     messages = pending_forwarded_messages[user_id_str]["messages"]
     
     if not messages:
+        await update.message.reply_text("❌ No forwarded messages to process.")        
         return
     
     # Combine all message contents
@@ -982,9 +1081,12 @@ async def process_forwarded_messages_batch(update, context, user_id_str):
     # Create combined task content
     task_content = "\n---\n".join(combined_content)
     
+    # Escape special characters in task content
+    escaped_task_content = escape_markdown(task_content, version=2)
+    
     # Store only the first message ID as the reference
     first_message_id = message_ids[0] if message_ids else None
-    
+
     # Store only the first link
     first_link = links[0] if links else None
     
@@ -1017,15 +1119,15 @@ async def process_forwarded_messages_batch(update, context, user_id_str):
     debug_text = "\n".join(debug_info[:10]) + (f"\n... and {len(debug_info) - 10} more" if len(debug_info) > 10 else "")
     logger.debug(f"DEBUG: Forwarded message batch for user {user_id_str}:\n{debug_text}")
 
-    # Preview text
-    preview_text = task_content[:200] + "..." if len(task_content) > 200 else task_content
+    # Escape preview text
+    preview_text = escaped_task_content[:200] + "; " if len(escaped_task_content) > 200 else escaped_task_content
     
     # Send the combined message
     await update.message.reply_text(
         f"📨 *{len(messages)} Forwarded Messages Detected*\n\n"
         f"*Content Preview:*\n{preview_text}\n\n"
         f"Do you want to add these as a single task?",
-        parse_mode='Markdown',
+        parse_mode='MarkdownV2',
         reply_markup=reply_markup,
         disable_web_page_preview=True
     )
@@ -1216,6 +1318,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Update username mapping
     update_username_mapping(update.effective_user)
+    
+    # Check if the user is editing a task
+    if 'editing_task_id' in context.user_data:
+        task_id = context.user_data['editing_task_id']
+        del context.user_data['editing_task_id']
+        
+        # Find the task
+        task = None
+        if user_id_str in task_bot.tasks:
+            for t in task_bot.tasks[user_id_str]:
+                if t['id'] == task_id:
+                    task = t
+                    break
+        
+        if not task:
+            await message.reply_text("❌ Task not found.")
+            return
+        
+        # Preserve the old description
+        old_text = task['text']
+        task['previous_text'] = old_text
+        
+        # Update the task description
+        task['text'] = text
+        
+        # Save the updated tasks to the JSON file
+        with open(TASKS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(task_bot.tasks, f, indent=2)
+        
+        await message.reply_text(
+            f"✅ Task #{task_id} description updated successfully!\n\n"
+            f"**Old Description:**\n{old_text}\n\n"
+            f"**New Description:**\n{text}",
+            parse_mode='Markdown'
+        )
+        return
     
     # Check if we're expecting task text for a media group
     if context.user_data.get('expecting_task_text') and context.user_data.get('media_group_waiting'):
@@ -2096,6 +2234,7 @@ def main():
     application.add_handler(CommandHandler("archive", archive_task_command))
     application.add_handler(CommandHandler("archived", list_archived_tasks))
     application.add_handler(CommandHandler("addfor", add_task_for_user))
+    application.add_handler(CommandHandler("save", save_batch_command)) 
     
     # Add callback query handler
     application.add_handler(CallbackQueryHandler(button_callback))
